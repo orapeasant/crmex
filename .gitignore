@@ -1,0 +1,78 @@
+# --- Node / JavaScript / TypeScript ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+dist/
+build/
+out/
+coverage/
+.turbo/
+.next/
+.nuxt/
+.cache/
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# --- Baileys / WhatsApp session data (contains auth credentials) ---
+auth_session/
+*.session
+sessions/
+
+# SQLite queue DB
+*.sqlite
+*.sqlite3
+*.db
+gateway_queue.db
+
+# --- Android / Gradle ---
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+android/.cxx/
+android/*.iml
+android/.idea/
+*.keystore
+*.jks
+!debug.keystore
+
+# --- Capacitor ---
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+ios/App/App/public/
+.capacitor/
+
+# --- Android Studio / IntelliJ ---
+.idea/
+*.iml
+.gradle/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# --- macOS / Windows / Linux OS files ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Editor ---
+.vscode/
+*.swp
+
+# --- Logs ---
+logs/
+*.log
+
+
+#doc
+*.md
+!README.md
