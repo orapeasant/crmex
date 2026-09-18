@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Leagentex</string>
+    <string name="title_activity_main">Leagentex</string>
+    <string name="package_name">com.crmex.gateway</string>
+    <string name="custom_url_scheme">com.crmex.gateway</string>
+    <!-- Overrides @southdevs/capacitor-google-auth's library default, which
+         ships the literal placeholder "Your Web Client Key". That default is
+         the last fallback in GoogleAuth.java's
+         androidClientId -> clientId -> R.string.server_client_id chain, so
+         leaving it in place means any config-key mistake fails as an opaque
+         GoogleSignIn DEVELOPER_ERROR (code 10) instead of anything readable.
+         Must stay in sync with `clientId` in capacitor.config.ts. -->
+    <string name="server_client_id">620521815022-hujedvo32ttsd4g1qtvnd9sfo9v7bh6f.apps.googleusercontent.com</string>
+</resources>

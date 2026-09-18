@@ -1,0 +1,11 @@
+{
+  "name": "crmex",
+  "private": true,
+  "workspaces": [
+    "core-server",
+    "shared-ui"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}

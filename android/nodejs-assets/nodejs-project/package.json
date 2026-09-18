@@ -1,0 +1,10 @@
+{
+  "name": "crmex-node-payload",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Embedded Node payload: Baileys WhatsApp socket + pacing loop only. No database, no HTTP server (crmex.md §9.1, §10.4).",
+  "main": "main.js",
+  "dependencies": {
+    "baileys": "6.7.24"
+  }
+}
