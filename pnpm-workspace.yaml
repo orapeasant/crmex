@@ -1,0 +1,12 @@
+# The Android shell is deliberately NOT a workspace member: Capacitor's CLI and
+# Gradle resolve plugins from a flat node_modules, which pnpm's symlinked layout
+# breaks. Install it with npm from android/ (see README).
+packages:
+  - core-server
+  - shared-ui
+  - web-ui
+
+# Vite/tsx need esbuild's platform binary, which its install script links.
+# pnpm 10 blocks dependency build scripts unless they are listed here.
+onlyBuiltDependencies:
+  - esbuild

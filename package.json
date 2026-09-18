@@ -1,11 +1,16 @@
 {
   "name": "crmex",
   "private": true,
-  "workspaces": [
-    "core-server",
-    "shared-ui"
-  ],
+  "packageManager": "pnpm@10.15.0",
   "engines": {
     "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter core-server --filter crmex-web dev",
+    "dev:server": "pnpm --filter core-server dev",
+    "dev:web": "pnpm --filter crmex-web dev",
+    "build": "pnpm --filter core-server --filter crmex-web build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
   }
 }
