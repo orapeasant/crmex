@@ -223,8 +223,8 @@ as the explicitly-sanctioned fallback.
 
 ## What's built vs. what's still a skeleton
 
-**Built and unit/integration-tested** (`shared-ui`, 69 tests passing, see
-`../shared-ui/package.json` — `npm test`):
+**Built and unit/integration-tested** (`shared-ui`, 152 tests passing as of 2026-09-19, see
+`../shared-ui/package.json` — `pnpm test`):
 - E.164 phone normalization + `needsReview` bucket + region re-evaluation (PHN-01..10, CON-04..07)
 - JID derivation
 - SIM-region → locale → hard-default precedence (`resolveDefaultRegion`, PHN-08)
@@ -245,11 +245,17 @@ as the explicitly-sanctioned fallback.
 `MediaSavePlugin`). These compile (see Gradle result above) but their
 actual runtime behavior against real Android APIs has not been exercised.
 
-**Not built in this pass** (scaffolded architecturally, no screens yet):
-Full contact-search / image-generate-refine / send-confirmation *screens*
-wired together into one flow. `App.tsx` currently only implements
-sign-in-gate → WhatsApp QR pairing, which is enough to prove the two seams
-(`ApiClient`, `NativeBridge`) and the Step 0 spike, but stops short of
+**Superseded — this section described the state before the app shell.** As of
+2026-09-19 the shared app (`shared-ui/src/app/`) is a four-tab shell (Clients ·
+Matters · Tasks · Messages) with firm onboarding and a switcher, and the
+Compose → Contacts → Review → Schedule send wizard is wired end to end; PLAN.md
+steps 0–16 are done. The paragraph below is kept only for the seam description,
+which is still accurate.
+
+*Historic:* Full contact-search / image-generate-refine / send-confirmation
+*screens* wired together into one flow. `App.tsx` then only implemented
+sign-in-gate → WhatsApp QR pairing, which was enough to prove the two seams
+(`ApiClient`, `NativeBridge`) and the Step 0 spike, but stopped short of
 PLAN.md step 7 ("wire the end-to-end flow"). The components that exist
 (`QrPairing`, `SendConfirmation`) are real and tested; `ContactMatchScreen`
 and an `ImageCanvas` component are not yet written. Given the scope of

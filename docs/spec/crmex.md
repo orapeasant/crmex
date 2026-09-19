@@ -147,8 +147,11 @@ Runs in the **WebView** via `@capacitor-community/sqlite`, not in the Node proce
 create table outbox (
   id           integer primary key autoincrement,
   user_id      text not null,
+  org_id       text not null default '',  -- the firm the batch belongs to (§15, TEN-37)
   batch_id     text not null,
   jid          text not null,
+  client_id    text,                 -- the firm client this recipient is, for mirroring
+  display_name text,
   body         text,
   media_path   text,                 -- storage object path (§3.3), null for text-only
   status       text not null default 'PENDING',   -- PENDING | CLAIMED | SENT | FAILED
@@ -158,17 +161,20 @@ create table outbox (
 
 -- Index of which storage objects are cached on this device, for eviction.
 create table image_cache (
-  media_path   text primary key,     -- same path as in Supabase Storage
+  media_path   text not null,        -- same path as in Supabase Storage
   user_id      text not null,
   local_file   text not null,        -- filesystem path within the user's cache dir
   bytes        integer not null,
   cached_at    integer not null,
-  last_used_at integer not null
-);
+  last_used_at integer not null,
+  primary key (user_id, media_path)  -- per user: a bare media_path key would let
+);                                   -- two accounts on one device collide
 
 create index outbox_pending on outbox (user_id, status);
 create index cache_by_user on image_cache (user_id, last_used_at);
 ```
+
+`org_id` is added by a migration on databases created before multi-tenancy, defaulting to `''`; a device that has never switched firms is unaffected. Clearing the outbox is scoped `where user_id = ? and org_id = ?`, which is what keeps Firm A's unsent rows from replaying while Firm B is active (TEN-37).
 
 **Every table carries `user_id` and every query filters on it.** A phone can have more than one account signed in over its lifetime; one user must never read another's rows.
 
@@ -497,6 +503,14 @@ Fixed by the §9.2 design, but recorded so they are not reintroduced:
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- Never used: the app reads the address book and never writes back (§7.1).
+         It is declared because @capacitor-community/contacts groups READ and
+         WRITE under one "contacts" permission alias, and Capacitor refuses the
+         alias request unless every permission in it is in the manifest. Removing
+         it breaks contact import. It is also the permission a Play reviewer is
+         most likely to ask about, so the reason is recorded here rather than
+         only in a manifest comment. -->
+    <uses-permission android:name="android.permission.WRITE_CONTACTS" />
     <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

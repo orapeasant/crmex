@@ -350,6 +350,7 @@ verify pacing and volume by asserting on timing and queue state, not by sending 
 | Timezone of client messages | §16.13 D6 | Open — recommendation: client's own, else firm's |
 | SIM region: custom plugin vs locale fallback | §14 | Plugin built; on-device behaviour unverified |
 | Contact metadata sent to the LLM for NL matching | §14 | Open |
+| `minSdk` 24 vs the API 29 test device | §11.5 | **Open** — at 24 the API 28-and-below save-to-Photos path (SAV-02) ships to real users but cannot be exercised on the P30 Pro; raising to 29 drops Android 7–9 devices |
 | §18 C-D1, C-D2, C-D5 | §18.8 | **Decided 2026-09-18** (30 s default, floor 10 s; reuse batch cap; cancel-and-recreate) |
 | §18 C-D3 (concurrent campaigns), C-D6 (recipient overlap) | §18.8 | **Decided 2026-09-19** — interleave, except under-20 runs start 1–2 min later; warn above 10 % overlap |
 | §18 C-D4 (`{name}` fallback) | §18.8 | **Closed 2026-09-19 as moot** — `display_name` is `not null`, so no fallback is reachable |
@@ -407,13 +408,25 @@ verify pacing and volume by asserting on timing and queue state, not by sending 
 
 Not fixed here; listed so they can be triaged.
 
-1. `android/README.md` "What's built" / "What's left" sections predate the app shell
-   (says `App.tsx` is sign-in + QR only; cites 69 tests vs 113 now).
-2. `WRITE_CONTACTS` in the manifest has no counterpart in the spec (§3.7).
-3. `@capacitor/local-notifications` is a dependency but unused in code.
-4. Spec §3.2's `outbox` has no `org_id`, while §15 and TEN-37 require firm-aware behaviour on
-   the device — verify how `SqliteLocalStore` handles it.
-5. `minSdk` is 24 while the documented test device is API 29 — fine, but the API 28-and-below
-   paths (SAV-02) then apply to real installs and are only testable on an older emulator.
-6. §16.13 D8 says confirming §16 reverses "campaign scheduling / push reminders" being out of
-   scope in `PLAN.md` §3; §3 has not been updated yet.
+Triaged 2026-09-19. Outcomes recorded inline.
+
+1. ~~`android/README.md` predates the app shell~~ — **fixed.** Test count corrected (152, not
+   69) and the "not built in this pass" section marked superseded, keeping the seam
+   description which is still accurate.
+2. ~~`WRITE_CONTACTS` has no counterpart in the spec~~ — **not a defect; spec updated.** The
+   app never writes contacts, but `@capacitor-community/contacts` groups READ and WRITE under
+   one permission alias and Capacitor refuses the alias request unless both are declared, so
+   removing it would break contact import. The reason now lives in §10.1 as well as the
+   manifest comment, because it is the permission a Play reviewer is most likely to query.
+   (Not verified against plugin source — `android/node_modules` is not installed here.)
+3. `@capacitor/local-notifications` declared but unused — **keep.** §16.6.2 makes it the
+   phase-1 staff-reminder channel and §16 stage 1 is the next build step, so removing it now
+   only to re-add it is churn. Revisit if §16 slips.
+4. ~~Spec §3.2's `outbox` has no `org_id`~~ — **spec lag, not a code bug; spec updated.** The
+   shipped schema has `org_id` (added by migration for pre-tenancy databases), plus
+   `client_id` and `display_name`, and clearing is scoped by `(user_id, org_id)` per TEN-37.
+   `image_cache` also keys on `(user_id, media_path)`, not a bare `media_path` — the code is
+   right, since a global key would collide between two accounts on one device.
+5. `minSdk` 24 vs the API 29 test device — **open, needs a product decision.** See §7.
+6. ~~`PLAN.md` §3 still lists campaign scheduling as out of scope~~ — **fixed** for the
+   campaign half; "push reminders" stays until §16 stage 1 lands.
