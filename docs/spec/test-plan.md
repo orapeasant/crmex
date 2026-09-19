@@ -453,7 +453,7 @@ Designed, not implemented. Uses the §18 two-firm fixture (Firm A: A1, A2; Firm 
 | CAM-17 | A client is set `inactive` and later back to `active`, having opted out while active | Reactivation does not clear `suppressed_at`; the client is still never messaged | I |
 | CAM-09 | App killed mid-campaign, then relaunched | Unsettled `outbox` rows survive; the job shows **Paused — resume**; claimed-but-unsettled recipients are surfaced, never silently resent (§9.2) | D |
 | CAM-10 | Two campaigns become due at the same moment on one phone: one of 400 recipients, one of 12 | The 400 interleaves, with the pacing floor between any two messages; the 12-recipient run is started 1–2 min later instead of interleaved (C-D3, §18.5). Neither run drops below the floor | D |
-| CAM-11 | Browser cancels a `queued` campaign, then a `claimed` one | First succeeds; second rejected — the phone owns a claimed run (§18.6) | I |
+| CAM-11 | Browser cancels a `queued` campaign, then a `claimed` one | First succeeds. ~~Second rejected~~ — **amended 2026-09-19 by §23.4 / `MSG-22`:** the second is now accepted as a *cancel request* (`cancel_requested_at`) that the phone honours before its next send, so this case asserts the request is recorded, not that it is refused | I |
 | CAM-12 | B1 reads, cancels or claims a Firm A campaign | Zero rows / not found | I |
 | CAM-13 | Progress while a campaign runs | Counts derive from `message_history` rows with `batch_id = job.id`; the browser sees them over Realtime; no counter column exists to disagree | I |
 | CAM-14 | `{name}` used twice in a body; a recipient with no display name | Both occurrences rendered (§9.5); the nameless recipient falls back per C-D4 and is reported | U |
