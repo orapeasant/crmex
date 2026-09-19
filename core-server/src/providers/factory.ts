@@ -12,6 +12,9 @@ export interface ProviderEnv {
   IMAGE_SEARCH_PROVIDER?: string;
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
+  /** Optional gateway URLs (e.g. a LiteLLM proxy); unset means the vendor's default. */
+  ANTHROPIC_BASE_URL?: string;
+  OPENAI_BASE_URL?: string;
   UNSPLASH_ACCESS_KEY?: string;
   /** Optional model overrides — names only; unset means the adapter's default. */
   ANTHROPIC_MODEL?: string;
@@ -31,7 +34,7 @@ export function createLlmProvider(env: ProviderEnv): LlmProvider {
   switch (kind) {
     case 'anthropic': {
       if (!env.ANTHROPIC_API_KEY) throw new Error('LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY');
-      return createAnthropicLlmProvider(env.ANTHROPIC_API_KEY, env.ANTHROPIC_MODEL || undefined);
+      return createAnthropicLlmProvider(env.ANTHROPIC_API_KEY, env.ANTHROPIC_MODEL || undefined, env.ANTHROPIC_BASE_URL || undefined);
     }
     case 'fake':
       return createFakeLlmProvider();
@@ -50,7 +53,7 @@ export function createDraftLlmProvider(env: ProviderEnv): LlmProvider {
   switch (kind) {
     case 'anthropic': {
       if (!env.ANTHROPIC_API_KEY) throw new Error('LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY');
-      return createAnthropicLlmProvider(env.ANTHROPIC_API_KEY, env.ANTHROPIC_DRAFT_MODEL || DEFAULT_DRAFT_MODEL);
+      return createAnthropicLlmProvider(env.ANTHROPIC_API_KEY, env.ANTHROPIC_DRAFT_MODEL || DEFAULT_DRAFT_MODEL, env.ANTHROPIC_BASE_URL || undefined);
     }
     case 'fake':
       return createFakeLlmProvider();
@@ -64,7 +67,7 @@ export function createImageGenProvider(env: ProviderEnv): ImageGenProvider {
   switch (kind) {
     case 'openai': {
       if (!env.OPENAI_API_KEY) throw new Error('IMAGE_GEN_PROVIDER=openai requires OPENAI_API_KEY');
-      return createOpenAiImageGenProvider(env.OPENAI_API_KEY, env.OPENAI_IMAGE_MODEL || undefined);
+      return createOpenAiImageGenProvider(env.OPENAI_API_KEY, env.OPENAI_IMAGE_MODEL || undefined, env.OPENAI_BASE_URL || undefined);
     }
     case 'fake':
       return createFakeImageGenProvider();

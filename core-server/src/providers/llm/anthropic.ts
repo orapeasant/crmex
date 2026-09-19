@@ -12,8 +12,8 @@ export const DEFAULT_DRAFT_MODEL = 'claude-haiku-4-5';
  * providers/llm/fake.ts via LLM_PROVIDER=fake so the suite has zero network
  * dependency and needs no real key.
  */
-export function createAnthropicLlmProvider(apiKey: string, model: string = DEFAULT_MODEL): LlmProvider {
-  const client = new Anthropic({ apiKey });
+export function createAnthropicLlmProvider(apiKey: string, model: string = DEFAULT_MODEL, baseURL?: string): LlmProvider {
+  const client = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) });
 
   function splitSystem(messages: ChatMessage[]): { system?: string; rest: Array<{ role: 'user' | 'assistant'; content: string }> } {
     const systemParts = messages.filter((m) => m.role === 'system').map((m) => m.content);

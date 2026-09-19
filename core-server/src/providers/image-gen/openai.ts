@@ -36,8 +36,8 @@ export function shouldFallBackToGenerate(err: unknown): boolean {
  * gpt-image-1 always returns base64 (`b64_json`) and rejects
  * `response_format`, so none is sent; output is PNG by default.
  */
-export function createOpenAiImageGenProvider(apiKey: string, model: string = DEFAULT_MODEL): ImageGenProvider {
-  const client = new OpenAI({ apiKey });
+export function createOpenAiImageGenProvider(apiKey: string, model: string = DEFAULT_MODEL, baseURL?: string): ImageGenProvider {
+  const client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
 
   async function generate(prompt: string, opts?: { width?: number; height?: number }): Promise<GeneratedImage> {
     const size = opts?.width && opts?.height ? (`${opts.width}x${opts.height}` as const) : undefined;
