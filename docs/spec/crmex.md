@@ -1704,7 +1704,7 @@ Runs in the §16.6 dispatcher process, **once an hour** rather than every 60 s �
 
 **29 February** resolves to 28 February in non-leap years — one occurrence per year, never zero, never two (SCH-14 already asserts this for per-client yearly events; the rule path must agree).
 
-**Same-day pile-up.** Forty birthdays on one date would otherwise produce forty `send_jobs` all due at 09:00. The phone runs them sequentially (C-D3), so they would go out back to back with no pacing between jobs. The scanner therefore **staggers** a rule's occurrences that share a fire time, spacing them by the firm's `pacing.min_interval_ms` starting at `at_time`. Forty messages at a 30 s floor span twenty minutes, which is what a person sending them by hand would look like.
+**Same-day pile-up.** Forty birthdays on one date would otherwise produce forty `send_jobs` all due at 09:00 — forty single-recipient campaigns colliding, which under C-D3's under-20 rule would each be nudged a minute or two apart and still bunch up. The scanner therefore **staggers** a rule's occurrences that share a fire time, spacing them by the firm's `pacing.min_interval_ms` starting at `at_time`. Forty messages at a 30 s floor span twenty minutes, which is what a person sending them by hand would look like.
 
 ### 19.4 Editing a rule, and what does not change retroactively
 
@@ -1725,7 +1725,7 @@ With approval on, the honest description of the feature is *"it drafts and queue
 
 ### 19.6 Interaction with campaigns (§18)
 
-Both end at `send_jobs`, and a client can be in both on the same day. They are not deduplicated, because a birthday message and a firm announcement are different messages and suppressing either silently would be worse. The phone runs them sequentially with the pacing floor between, and the campaign screen shows "3 recipients also have a scheduled message today" before confirming.
+Both end at `send_jobs`, and a client can be in both on the same day. They are not deduplicated, because a birthday message and a firm announcement are different messages and suppressing either silently would be worse. The phone keeps the pacing floor between any two messages whichever job they belong to, and the campaign screen warns before confirming — the same 10 % rule as C-D6, counting a client's scheduled occurrence as an overlapping message.
 
 ### 19.7 Open decisions
 

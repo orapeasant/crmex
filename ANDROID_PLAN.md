@@ -90,8 +90,10 @@ kill behaviour, the real `READ_CONTACTS` flow, Gallery visibility of a saved ima
 foreground-service-driven batch.
 
 ### Not built (designed only)
-Everything in §16 (device notifications), §18 (campaigns) and §19 (occasion rules), plus
-FCM wake-up. See §4 and §5 below.
+Everything in §16 (device notifications) and §19 (occasion rules), plus FCM wake-up.
+**§18 (campaigns) is no longer in this list:** the migration, `POST /images/upload`, the
+`shared-ui` data layer and the wizard were built 2026-09-19. What remains is phone-side and
+listed in §4.3. See §4 and §5 below.
 
 ---
 
@@ -231,7 +233,19 @@ Phone-side (the wizard is `shared-ui`, so most of it is shared UI):
   with `jitter_pct`), not the global default; expired jobs are reported.
 - **Paused — resume:** a `claimed` job with unsettled `outbox` rows and no running batch is
   shown as Paused and never silently restarted (CAM-09).
-- **Sequential runs:** two campaigns due together run in claim order (CAM-10, C-D3).
+- **Concurrent runs (C-D3, revised 2026-09-19 — was "sequential"):** two campaigns due
+  together **interleave**, sharing the pacing floor between any two messages, so neither waits
+  for the other. The exception is a campaign of **under 20 recipients**, which is started
+  1–2 minutes later instead: a short run loses little by waiting and keeps its stated pacing
+  exactly true, whereas making a 400-recipient run wait hours is not an option (CAM-19).
+  Consequence for the phone: the interval it is given is a **floor**, not a promise, once a
+  second campaign is live.
+- **Device presence (§18.6, new 2026-09-19):** the phone upserts a `device_presence`
+  heartbeat (`user_id`, `device_id`, `label`, `last_seen_at`, `app_version`) on launch, on
+  resume and on the job-poll tick. This is what lets the campaign list answer "will this
+  actually run?" *before* the scheduled time rather than after it expires (CAM-21, CAM-22).
+  It is a new phone responsibility, small but not optional — without it the last-seen line
+  has nothing to read.
 - Compose flow steps 4–5 (image source, schedule and pace with the duration estimate
   "412 recipients · every 30 s (±25 %) · finishes ≈ 12:26").
 - **Pasted/attached images** go to `POST /api/v1/images/upload` (PNG only, metadata chunks
@@ -241,11 +255,19 @@ Phone-side (the wizard is `shared-ui`, so most of it is shared UI):
   `now()`, so a skewed phone can only delay itself (§18.3).
 - A phone-created campaign needs connectivity at compose time (C4); immediate sends still
   work offline via the direct path.
-- Campaign list shows status, derived progress, cancel, and the creator phone's last-seen.
+- Campaign list shows status, derived progress, cancel, and the creator phone's last-seen
+  (from `device_presence`; members read a colleague's `last_seen_at` but not their device
+  `label` or `app_version` — §15.5).
+- **Recipient overlap (C-D6, new 2026-09-19):** above 10 % shared recipients with another
+  campaign due the same day, the wizard warns with the counts and offers remove / reschedule
+  / send anyway. Shared UI, so nothing Android-specific — but it never auto-excludes, so the
+  phone still receives exactly the list the user approved.
 - Decided 2026-09-18: default interval 30 s, floor 10 s (`pacing.min_interval_ms`), reuse
-  `limits.max_batch_recipients`, cancel-and-recreate (no edit).
+  `limits.max_batch_recipients`, cancel-and-recreate (no edit). Decided 2026-09-19: C-D3 above,
+  C-D6 above, and C-D4 closed as **moot** — `clients.display_name` is `not null` with a
+  1–200 character check, so no `{name}` fallback is reachable.
 
-### 4.4 Occasion rules — §19, `PLAN.md` step 17
+### 4.4 Occasion rules — §19, `PLAN.md` step 18 (needs §16 stage 1, step 17)
 Mostly server-side (scanner in the dispatcher) and shared UI. The Android-specific part is
 only that its output arrives as the §4.1 notification and the §4.2 approval → `send_jobs`
 insert. Staggered fire times (forty birthdays spaced by `pacing.min_interval_ms`) mean the
@@ -255,6 +277,12 @@ phone still sees one job at a time. Nothing new for the phone to send with.
 Register a device token per `created_by`; a data-only push makes the phone poll
 `listRunnableJobs` sooner. **Never a second sender** — the atomic claim still decides.
 Needs a Firebase project and a device-token table. Not scheduled.
+
+**Direction (decided 2026-09-19):** the server will drive the schedule and the phone stays a
+gateway that only sends. That dispatcher is built **with §16**, which needs the same tick —
+not before it. For Android this changes nothing structurally: the phone keeps claiming, the
+trigger keeps enforcing the window, and a dispatcher (or a push) only shortens the delay
+before a claim happens.
 
 ### 4.6 Agentic engine — §17
 Server-side (`core-server` → gyrfalcon). Android inherits any chat UI from `shared-ui`; I
@@ -275,14 +303,15 @@ Ordered by what unblocks the most; A1 is the only real gate.
 | A4 | Manifest audit: `WRITE_CONTACTS`, `WRITE_EXTERNAL_STORAGE maxSdkVersion` | — | See §3.7 |
 | A5 | **Distribution decision**: sideload vs Google Play | — | Blocks whether `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` ships; Play policy is hostile to WhatsApp bulk-messaging apps. Resolve *before* release work. |
 | A6 | Release build: signing config, split-ABI APKs / App Bundle (debug APK is ~175 MB with `libnode.so` × 3 ABIs) | A5 | `targetSdk` is already 36 |
-| A7 | Campaign phone-side work (§4.3) | Spec §18 approval; migration | PLAN step 16 |
+| A7 | Campaign phone-side work (§4.3): presence heartbeat, interleave + under-20 stagger, Paused-resume, expired reporting | Migration applied | PLAN step 16. Server and shared-UI parts are **done** (2026-09-19); §18's decisions are all closed. The migration is written but **not applied**, which is the actual blocker. |
 | A8 | Device notifications (§4.1) + notification settings + Huawei prompt | Spec §16 approval; §16.10 steps 16–18 (schema, calendar UI, dispatcher) | §16.10 step 19 |
 | A9 | Reminder client messages (§4.2) | A8; §16.10 step 21 | |
 | A10 | Occasion-rule approval path (§4.4) | A9; §19 build steps | Minimal Android work |
 | A11 | Reliable staff channel — email or FCM (§16.13 D1, §18.9) | Decision D1 | Email is the recommendation; FCM later |
 
-`PLAN.md` lists §16–§19 as "designed, under review"; steps 16–17 there are marked "after
-approval". They are not yet approved work.
+`PLAN.md` step 16 (§18 campaigns) is **built** as of 2026-09-19, apart from the phone-side
+items in §4.3 and with the migration not yet applied. Steps 17 (§16 stage 1) and 18 (§19) are
+decided in principle but not started: §16.13 D1–D8 are still open and gate stage 1.
 
 ---
 
@@ -300,7 +329,7 @@ Levels: **D** device, **M** manual, **I** integration, **U** unit.
 | Isolation | ISO-13 (sign-out purges cache) | D |
 | Multi-tenancy | TEN-28 (two devices, one claim), TEN-37 (firm switch with unsent outbox) | D |
 | Scheduling | SCH-16 (sign-out clears local notifications) | D |
-| Campaigns | CAM-09 (kill mid-campaign → Paused/resume), CAM-10 (sequential runs) | D |
+| Campaigns | CAM-09 (kill mid-campaign → Paused/resume), CAM-10 (concurrent runs: interleave, under-20 stagger) | D |
 | Cross-platform | XPL-05 (no `admin-ui` assets in the APK) | U — build-time assertion over the APK |
 
 The unit and integration halves of these areas are covered by the offline suites
@@ -322,7 +351,11 @@ verify pacing and volume by asserting on timing and queue state, not by sending 
 | SIM region: custom plugin vs locale fallback | §14 | Plugin built; on-device behaviour unverified |
 | Contact metadata sent to the LLM for NL matching | §14 | Open |
 | §18 C-D1, C-D2, C-D5 | §18.8 | **Decided 2026-09-18** (30 s default, floor 10 s; reuse batch cap; cancel-and-recreate) |
-| §18 C-D3 (sequential), C-D4 (`{name}` fallback) | §18.8 | Recommendations only, not marked decided |
+| §18 C-D3 (concurrent campaigns), C-D6 (recipient overlap) | §18.8 | **Decided 2026-09-19** — interleave, except under-20 runs start 1–2 min later; warn above 10 % overlap |
+| §18 C-D4 (`{name}` fallback) | §18.8 | **Closed 2026-09-19 as moot** — `display_name` is `not null`, so no fallback is reachable |
+| §18.6 device presence | §18.6 | **Decided 2026-09-19** — phone writes a `device_presence` heartbeat; see §4.3 |
+| Where the campaign schedule is driven from | §18.6 | **Decided 2026-09-19** — server-side dispatcher, built with §16; phone stays a gateway |
+| §16 scope and ordering | `PLAN.md` step 17 | **Decided 2026-09-19** — staged: `events` + `event_reminders` + dispatcher tick first; templates, move functions and overdue sweep deferred |
 | Occasion rules O-D1..O-D5 | §19.7 | Open |
 
 ---

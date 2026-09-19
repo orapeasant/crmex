@@ -405,13 +405,12 @@ Designed, not implemented. Uses the §18 two-firm fixture (Firm A: A1, A2; Firm 
 | CAM-16 | Selection with a mix of `active`, `inactive` and `archived` clients, some opted out | Only active, non-suppressed, phone-bearing clients are selectable; the excluded line counts opt-out and inactive separately (§18.3.1) | I |
 | CAM-17 | A client is set `inactive` and later back to `active`, having opted out while active | Reactivation does not clear `suppressed_at`; the client is still never messaged | I |
 | CAM-09 | App killed mid-campaign, then relaunched | Unsettled `outbox` rows survive; the job shows **Paused — resume**; claimed-but-unsettled recipients are surfaced, never silently resent (§9.2) | D |
-| CAM-10 | Two campaigns become due at the same moment on one phone | Run sequentially by claim order; neither run's effective interval is shortened | D |
+| CAM-10 | Two campaigns become due at the same moment on one phone: one of 400 recipients, one of 12 | The 400 interleaves, with the pacing floor between any two messages; the 12-recipient run is started 1–2 min later instead of interleaved (C-D3, §18.5). Neither run drops below the floor | D |
 | CAM-11 | Browser cancels a `queued` campaign, then a `claimed` one | First succeeds; second rejected — the phone owns a claimed run (§18.6) | I |
 | CAM-12 | B1 reads, cancels or claims a Firm A campaign | Zero rows / not found | I |
 | CAM-13 | Progress while a campaign runs | Counts derive from `message_history` rows with `batch_id = job.id`; the browser sees them over Realtime; no counter column exists to disagree | I |
 | CAM-14 | `{name}` used twice in a body; a recipient with no display name | Both occurrences rendered (§9.5); the nameless recipient falls back per C-D4 and is reported | U |
 | CAM-15 | `POST /images/upload` with a non-image, an oversized file, a JPEG, a PNG carrying an `eXIf`/`tEXt` chunk, and a client-supplied path fragment | Non-image, oversized and JPEG all rejected (PNG only, §18.4); the metadata chunks are absent from the stored bytes and the sha256 is of the sanitized result; the object path is built from the JWT and the client fragment ignored | I |
-| CAM-19 | Two campaigns due at the same moment: one of 400 recipients, one of 12 | The 400 interleaves with the pacing floor between any two messages; the 12-recipient run is started 1–2 min later instead of interleaved (§18.5) | U |
 | CAM-20 | Scheduling a campaign sharing 14% of its recipients with another due the same day; and one sharing 4% | First warns with both counts and the other campaign named, offering remove / reschedule / send anyway; second is silent. Neither auto-excludes anyone (§18.7) | I |
 | CAM-21 | `device_presence`: a user reads their own rows; a fellow firm member reads `last_seen_at`; a fellow member reads `label`/`app_version`; a non-member reads anything | Own rows readable and writable; `last_seen_at` readable by a firm member; `label`/`app_version` not; non-member gets zero rows (§18.6, §15.5) | I |
 | CAM-22 | Scheduling a campaign when the creator's phone was last seen 3 days ago | The wizard says so before confirming, rather than letting the user discover it when the campaign expires (§18.6) | I |
@@ -438,7 +437,7 @@ Designed, not implemented. Uses the §18 two-firm fixture. The scanner is tested
 | OCC-11 | B1 reads or edits Firm A rules, client dates or occurrences; A2 (`member`) creates or edits a rule | Zero rows / not found; A2 rejected — rules are owner/admin (§19.2) | I |
 | OCC-12 | A client-audience rule created with `sender_id` set to another member | Rejected, mirroring the `event_reminders` rule | I |
 | OCC-13 | `sender_id` is removed from the firm with occurrences pending | Rule disabled and owners notified; no occurrence sends from another member's phone (O-D5) | I |
-| OCC-14 | A client has both a rule occurrence and a campaign (§18) due the same day | Both delivered, run sequentially with the pacing floor between; the campaign screen warns before confirming (§19.6) | I |
+| OCC-14 | A client has both a rule occurrence and a campaign (§18) due the same day | Both delivered — never silently deduplicated — with the pacing floor between any two messages; the campaign screen warns before confirming (§19.6, C-D6) | I |
 | OCC-15 | The scanner is down for 3 days, then resumes | Occurrences still inside the horizon are materialized; ones whose fire time has passed follow §16.6.4 (skipped with the sender told), never sent days late | I |
 | OCC-16 | `client_dates` with a duplicate label for one client, and a `once` recurrence already in the past | Duplicate rejected by the unique key; the past one-off produces no occurrence | I |
 
