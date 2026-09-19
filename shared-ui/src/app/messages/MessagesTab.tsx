@@ -8,6 +8,7 @@ import { ChevronRightIcon, ClockIcon } from '../ui/icons.js';
 import { useAsync } from '../ui/useAsync.js';
 import { formatDateTime } from '../ui/util.js';
 import { JOB_STATUS } from './status.js';
+import { formatJobSchedule, isCampaignJob } from './wizard/schedule.js';
 import { SendWizard } from './wizard/SendWizard.js';
 
 export function MessagesTab({ active, onWizardFocus, onLinkWhatsApp }: { active: boolean; onWizardFocus: (focus: boolean) => void; onLinkWhatsApp: () => void }) {
@@ -71,7 +72,9 @@ function HistoryList() {
           <ul className="contact-list">
             {data.data.entries.map((e) => {
               const sender = e.senderId === user.id ? 'You' : memberLabel(data.data!.members.find((m) => m.user_id === e.senderId), 'Former member');
-              const inFlight = e.jobStatus === 'queued' || e.jobStatus === 'claimed' || e.jobStatus === 'cancelled' || e.jobStatus === 'failed';
+              const inFlight = e.jobStatus === 'queued' || e.jobStatus === 'claimed' || e.jobStatus === 'cancelled' || e.jobStatus === 'failed' || e.jobStatus === 'expired';
+              const scheduleInfo = { scheduled_at: e.scheduledAt, interval_ms: e.intervalMs, jitter_pct: e.jitterPct, expires_at: e.expiresAt };
+              const schedule = isCampaignJob(scheduleInfo) ? formatJobSchedule(scheduleInfo) : null;
               return (
                 <li key={e.id} className="contact-row" onClick={() => nav.push({ name: 'batch', batchId: e.id })}>
                   <div className="contact-row__text">
@@ -79,6 +82,7 @@ function HistoryList() {
                     <div className="contact-row__phone">
                       {formatDateTime(e.when)} · {sender} · {e.total} {e.total === 1 ? 'recipient' : 'recipients'}
                     </div>
+                    {schedule && <div className="faint">{schedule}</div>}
                   </div>
                   {inFlight && e.jobStatus ? (
                     <span className={JOB_STATUS[e.jobStatus].className}>{JOB_STATUS[e.jobStatus].label}</span>

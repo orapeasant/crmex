@@ -56,6 +56,13 @@ export class ProviderTimeoutError extends AppError {
   }
 }
 
+/** Upload exceeds `quota.max_upload_bytes` (§18.4, CAM-15). Checked before storing, never after. */
+export class PayloadTooLargeError extends AppError {
+  constructor(message = 'File too large') {
+    super(413, 'PAYLOAD_TOO_LARGE', message);
+  }
+}
+
 // --- Firm tenancy (crmex.md §15) -------------------------------------------
 
 /** X-Org-Id (or :orgId) missing or not a UUID. */

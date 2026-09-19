@@ -13,11 +13,11 @@ function setup() {
   const db = new FakeSupabaseDb();
   const c = createFakeSupabaseClient(db) as unknown as SupabaseClient;
   db.table('clients').push(
-    { id: 'alice', org_id: 'org-a', display_name: 'Alice', phone_e164: '+6591234567', suppressed_at: null },
-    { id: 'bob', org_id: 'org-a', display_name: 'Bob', phone_e164: '+6598765432', suppressed_at: null },
-    { id: 'opted-out', org_id: 'org-a', display_name: 'Olive', phone_e164: '+6591110000', suppressed_at: '2026-01-01T00:00:00Z' },
-    { id: 'nophone', org_id: 'org-a', display_name: 'Nemo', phone_e164: null, suppressed_at: null },
-    { id: 'other-firm', org_id: 'org-b', display_name: 'Mallory', phone_e164: '+6592220000', suppressed_at: null },
+    { id: 'alice', org_id: 'org-a', display_name: 'Alice', phone_e164: '+6591234567', suppressed_at: null, status: 'active' },
+    { id: 'bob', org_id: 'org-a', display_name: 'Bob', phone_e164: '+6598765432', suppressed_at: null, status: 'active' },
+    { id: 'opted-out', org_id: 'org-a', display_name: 'Olive', phone_e164: '+6591110000', suppressed_at: '2026-01-01T00:00:00Z', status: 'active' },
+    { id: 'nophone', org_id: 'org-a', display_name: 'Nemo', phone_e164: null, suppressed_at: null, status: 'active' },
+    { id: 'other-firm', org_id: 'org-b', display_name: 'Mallory', phone_e164: '+6592220000', suppressed_at: null, status: 'active' },
   );
   return { db, c };
 }
@@ -25,7 +25,7 @@ function setup() {
 describe('queueSendJob (browser queue mode)', () => {
   it('rebuilds recipients from the firm clients, excluding suppressed, phoneless and other-firm clients', async () => {
     const { db, c } = setup();
-    const { job, excludedClientIds } = await queueSendJob(c, {
+    const { job, excluded } = await queueSendJob(c, {
       orgId: 'org-a',
       userId: 'u1',
       body: ' Hello ',
@@ -33,7 +33,11 @@ describe('queueSendJob (browser queue mode)', () => {
     });
     expect(job).toMatchObject({ org_id: 'org-a', created_by: 'u1', status: 'queued', body: 'Hello', media_path: null });
     expect(job.recipients).toEqual([{ client_id: 'alice', jid: '6591234567@s.whatsapp.net', display_name: 'Alice' }]);
-    expect(excludedClientIds.sort()).toEqual(['nophone', 'opted-out', 'other-firm']);
+    expect([...excluded].sort((a, b) => a.clientId.localeCompare(b.clientId))).toEqual([
+      { clientId: 'nophone', reason: 'no_phone' },
+      { clientId: 'opted-out', reason: 'suppressed' },
+      { clientId: 'other-firm', reason: 'not_found' },
+    ]);
     const clientQuery = db.queries.find((q) => q.table === 'clients')!;
     expect(clientQuery.filters).toContainEqual({ col: 'org_id', op: 'eq', val: 'org-a' });
   });
@@ -65,6 +69,16 @@ describe('claimSendJob', () => {
     expect((await claimSendJob(c, 'u1', job))?.status).toBe('claimed');
     expect(await claimSendJob(c, 'u1', job)).toBeNull();
   });
+
+  it('CAM-02/CAM-03: refuses to claim before scheduled_at or past expires_at', async () => {
+    const { db, c } = setup();
+    const { job: future } = await queueSendJob(c, { orgId: 'org-a', userId: 'u1', body: 'x', clientIds: ['alice'], scheduledAt: '2999-01-01T00:00:00Z' });
+    expect(await claimSendJob(c, 'u1', future)).toBeNull();
+
+    const { job: expired } = await queueSendJob(c, { orgId: 'org-a', userId: 'u1', body: 'y', clientIds: ['bob'] });
+    db.table('send_jobs').find((r) => r.id === expired.id)!.expires_at = '2000-01-01T00:00:00Z';
+    expect(await claimSendJob(c, 'u1', expired)).toBeNull();
+  });
 });
 
 describe('runSendJob (phone side)', () => {
@@ -90,6 +104,48 @@ describe('runSendJob (phone side)', () => {
     expect(skippedHistory).toHaveLength(1);
     expect(skippedHistory[0]).toMatchObject({ org_id: 'org-a', batch_id: job.id, client_id: 'bob', status: 'SKIPPED', error_reason: 'SUPPRESSED' });
     expect(db.table('send_jobs')[0].status).toBe('done');
+  });
+
+  it('honours an opt-out at claim time even when the client changed their phone number since queueing', async () => {
+    const { db, c } = setup();
+    const job = await queued(c, ['alice', 'bob']);
+    // Bob opts out AND his number is corrected afterwards. The recipient jid was frozen at
+    // queue time, so a suppression set derived only from current phone numbers would miss him.
+    const bob = db.table('clients').find((r) => r.id === 'bob')!;
+    bob.suppressed_at = '2026-09-13T00:00:00Z';
+    bob.phone_e164 = '+6590000001';
+    const sendBatch = vi.fn(async (_org: string, _batch: string, _q: BuiltQueue) => {});
+    await runSendJob({ supabase: c, userId: 'u1', checkRegistered: async (jids) => Object.fromEntries(jids.map((j) => [j, true])), sendBatch }, job);
+
+    const [, , queue] = sendBatch.mock.calls[0];
+    expect(queue.items.map((i) => i.clientId)).toEqual(['alice']);
+    expect(queue.skipped).toEqual([{ jid: '6598765432@s.whatsapp.net', displayName: 'Bob', reason: 'SUPPRESSED' }]);
+  });
+
+  it('CAM-08: re-checks status at claim time and reports an inactive recipient under its own reason', async () => {
+    const { db, c } = setup();
+    const job = await queued(c, ['alice', 'bob']);
+    // Bob goes inactive after the browser queued the job.
+    db.table('clients').find((r) => r.id === 'bob')!.status = 'inactive';
+    const sendBatch = vi.fn(async (_org: string, _batch: string, _q: BuiltQueue) => {});
+    const outcome = await runSendJob({ supabase: c, userId: 'u1', checkRegistered: async (jids) => Object.fromEntries(jids.map((j) => [j, true])), sendBatch }, job);
+
+    expect(outcome).toBe('done');
+    const [, , queue] = sendBatch.mock.calls[0];
+    expect(queue.skipped).toEqual([{ jid: '6598765432@s.whatsapp.net', displayName: 'Bob', reason: 'INACTIVE' }]);
+    const skippedHistory = db.table('message_history');
+    expect(skippedHistory).toContainEqual(expect.objectContaining({ client_id: 'bob', status: 'SKIPPED', error_reason: 'INACTIVE' }));
+  });
+
+  it('reports an already-expired job without claiming it', async () => {
+    const { db, c } = setup();
+    const job = await queued(c, ['alice']);
+    db.table('send_jobs').find((r) => r.id === job.id)!.expires_at = '2000-01-01T00:00:00Z';
+    const stale = db.table('send_jobs').find((r) => r.id === job.id) as unknown as SendJobRow;
+    const sendBatch = vi.fn();
+    expect(await runSendJob({ supabase: c, userId: 'u1', checkRegistered: async () => ({}), sendBatch }, stale)).toBe('expired');
+    expect(sendBatch).not.toHaveBeenCalled();
+    expect(db.table('send_jobs').find((r) => r.id === job.id)!.status).toBe('queued');
   });
 
   it('never runs a job created by another user', async () => {

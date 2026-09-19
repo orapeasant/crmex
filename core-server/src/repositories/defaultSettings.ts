@@ -12,6 +12,14 @@ export interface SettingsShape {
   'quota.default_storage_bytes': number;
   /** Not seeded by a migration yet — settingsRepo falls back to this default until a row is inserted. */
   'quota.default_daily_drafts': number;
+  /**
+   * Per-request cap for POST /images/upload (§18.4, CAM-15). Not seeded by a
+   * migration yet — settingsRepo falls back to this default until a row is
+   * inserted. 10 MB comfortably covers a canvas.toBlob PNG of a phone photo
+   * while keeping a single request from parking an unreasonable amount of
+   * memory before sanitizePng() even runs.
+   */
+  'quota.max_upload_bytes': number;
   'limits.max_batch_recipients': number;
   'pacing.min_interval_ms': number;
   'pacing.max_interval_ms': number;
@@ -27,6 +35,7 @@ export const DEFAULT_SETTINGS: SettingsShape = {
   'quota.default_daily_images': 50,
   'quota.default_storage_bytes': 500_000_000,
   'quota.default_daily_drafts': 200,
+  'quota.max_upload_bytes': 10_000_000,
   'limits.max_batch_recipients': 200,
   'pacing.min_interval_ms': 7000,
   'pacing.max_interval_ms': 18000,

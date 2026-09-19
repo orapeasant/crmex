@@ -9,8 +9,9 @@ import { ErrorCard, LoadingCard, ScreenHeader } from '../ui/components.js';
 import { useAsync } from '../ui/useAsync.js';
 import { describeError, formatDateTime } from '../ui/util.js';
 import { JOB_STATUS, SKIP_REASON_LABELS, STATUS_BADGE } from './status.js';
+import { formatJobSchedule, isCampaignJob } from './wizard/schedule.js';
 
-const FINISHED = new Set(['done', 'cancelled', 'failed']);
+const FINISHED = new Set(['done', 'cancelled', 'failed', 'expired']);
 
 export function BatchDetail({ batchId }: { batchId: string }) {
   const nav = useNav();
@@ -104,10 +105,15 @@ export function BatchStatus({ batchId }: { batchId: string }) {
           {failed > 0 && <span className="badge badge--danger">{failed} failed</span>}
           <span className="badge badge--neutral">{recipients.length} {recipients.length === 1 ? "recipient" : "recipients"}</span>
         </div>
+        {/* Schedule and pace (crmex.md §18.6): shown only for a campaign — a job with any of the three §18.3.2 columns set. */}
+        {job && isCampaignJob(job) && <div className="faint">{formatJobSchedule(job)}</div>}
         {job?.status === 'queued' && (
-          <div className="alert alert--info">Waiting for your phone. It sends this message when Leagentex is open on it with WhatsApp linked and an internet connection.</div>
+          <div className="alert alert--info">
+            Waiting for your phone. It sends this message when CRMEX is open on it with WhatsApp linked and an internet connection — it must stay online for the whole run.
+          </div>
         )}
-        {job?.status === 'claimed' && <div className="alert alert--info">Your phone is sending this message now, one recipient at a time.</div>}
+        {job?.status === 'claimed' && <div className="alert alert--info">Your phone is sending this message now, one recipient at a time. It can't be cancelled from here while it's running.</div>}
+        {job?.status === 'expired' && <div className="alert alert--warning">This ran past its late window before your phone picked it up, so it was never sent.</div>}
         {job?.status === 'failed' && job.error && <div className="alert alert--error">{job.error}</div>}
         {job?.status === 'queued' && job.created_by === user.id && (
           <button

@@ -15,6 +15,16 @@ export interface FakeFilter {
   val: unknown;
 }
 
+/** Parses a PostgREST-style `.or("col.op.val,col.op.val")` expression into filters OR'd together. */
+function parseOrExpr(expr: string): FakeFilter[] {
+  return expr.split(',').map((clause) => {
+    const [col, op, ...rest] = clause.split('.');
+    const raw = rest.join('.');
+    if (op === 'is') return { col, op: 'is', val: raw === 'null' ? null : raw } satisfies FakeFilter;
+    return { col, op: op as FakeFilter['op'], val: raw } satisfies FakeFilter;
+  });
+}
+
 export interface FakeQueryLog {
   table: string;
   op: 'select' | 'insert' | 'upsert' | 'update' | 'delete';
@@ -103,6 +113,7 @@ class FakeQueryBuilder implements PromiseLike<Result> {
   private payloadRows: FakeTableRow[] = [];
   private patch: FakeTableRow = {};
   private filters: FakeFilter[] = [];
+  private orGroups: FakeFilter[][] = [];
   private orderBys: { col: string; ascending: boolean }[] = [];
   private limitN: number | null = null;
   private returning = false;
@@ -169,6 +180,10 @@ class FakeQueryBuilder implements PromiseLike<Result> {
   not(col: string, operator: string, val: unknown) {
     if (operator !== 'is') throw new Error(`fakeSupabase: not(${operator}) unsupported`);
     return this.filter(col, 'not.is', val);
+  }
+  or(expr: string) {
+    this.orGroups.push(parseOrExpr(expr));
+    return this;
   }
   ilike(col: string, val: string) {
     return this.filter(col, 'ilike', val);
@@ -247,7 +262,7 @@ class FakeQueryBuilder implements PromiseLike<Result> {
       table.push(...staged);
       affected.push(...staged);
     } else {
-      const hit = table.filter((r) => this.filters.every((f) => matches(r, f)));
+      const hit = table.filter((r) => this.filters.every((f) => matches(r, f)) && this.orGroups.every((group) => group.some((f) => matches(r, f))));
       if (this.op === 'update') {
         for (const r of hit) {
           const next = { ...r, ...this.patch };

@@ -6,9 +6,10 @@ import type { StorageRepo } from '../repositories/storageRepo';
 import { reserveImageGeneration } from '../quota/quota';
 import { buildObjectPath, isPathInOrg, isServableSessionPath } from '../lib/paths';
 import { sha256Hex } from '../lib/hash';
+import { sanitizePng, InvalidImageError } from '../lib/png';
 import { withTimeout, TimeoutError } from '../lib/withTimeout';
 import { createSessionLock } from '../lib/sessionLock';
-import { NotFoundError, ProviderError, ProviderTimeoutError, QuotaExceededError } from '../lib/errors';
+import { NotFoundError, PayloadTooLargeError, ProviderError, ProviderTimeoutError, QuotaExceededError, ValidationError } from '../lib/errors';
 import { DEFAULT_SETTINGS } from '../repositories/defaultSettings';
 
 export interface ImageAgentDeps {
@@ -215,6 +216,83 @@ export async function selectSearchedImage(
   }
 
   await deps.orgUsageRepo.addStorageBytes(scope.orgId, bytes.length);
+  const signedUrl = await deps.storageRepo.createSignedUrl(path);
+  return { sessionId, path, signedUrl, promptHistory };
+}
+
+/**
+ * POST /api/v1/images/upload (§18.4 step 4 "Paste or attach", CAM-15). PNG
+ * only — buildObjectPath always yields `.png` and core-server has no image
+ * decoder, so clients convert to PNG (canvas.toBlob) before posting; anything
+ * that doesn't parse as a PNG container is rejected. No generation cost, so
+ * only the storage ceiling applies, exactly as in selectSearchedImage.
+ */
+export async function uploadImage(deps: ImageAgentDeps, scope: FirmScope, bytes: Buffer): Promise<ImageResultPayload> {
+  // Size cap first, before any CPU work (sanitize/hash) or storage I/O. The
+  // route's express.raw({ limit }) is a hard, framework-enforced ceiling that
+  // rejects an oversized body while it is still streaming in; this is the
+  // adjustable policy limit, read the same way every other quota is
+  // (app_settings, falling back to DEFAULT_SETTINGS so a missing/malformed
+  // row can never mean "unlimited").
+  const maxUploadRaw = await deps.settingsRepo.get('quota.max_upload_bytes');
+  const maxUploadBytes =
+    Number.isFinite(Number(maxUploadRaw)) && Number(maxUploadRaw) > 0
+      ? Number(maxUploadRaw)
+      : DEFAULT_SETTINGS['quota.max_upload_bytes'];
+  if (bytes.length > maxUploadBytes) {
+    throw new PayloadTooLargeError(`Image exceeds the ${maxUploadBytes} byte upload limit.`);
+  }
+
+  const [storageLimitRaw, usage] = await Promise.all([
+    deps.settingsRepo.get('quota.default_storage_bytes'),
+    deps.orgUsageRepo.getToday(scope.orgId),
+  ]);
+  const storageLimit = Number.isFinite(Number(storageLimitRaw)) ? Number(storageLimitRaw) : DEFAULT_SETTINGS['quota.default_storage_bytes'];
+  if (usage.storage_bytes >= storageLimit) {
+    throw new QuotaExceededError(`Storage quota reached (${storageLimit} bytes).`);
+  }
+
+  // Every upload is stripped regardless of what the client claims to have
+  // sent: a client-side canvas.toBlob() drops EXIF, but a hostile or buggy
+  // client can still attach a PNG carrying an eXIf/tEXt/iCCP chunk. A file
+  // that isn't a structurally valid PNG (JPEG bytes, garbage, truncated
+  // container) is rejected here rather than reaching storage.
+  let sanitized: Buffer;
+  try {
+    sanitized = sanitizePng(bytes);
+  } catch (err) {
+    if (err instanceof InvalidImageError) throw new ValidationError(err.message);
+    throw err;
+  }
+
+  // Hashed AFTER stripping: the stored path must reflect what is actually
+  // stored, so the same visible image with different metadata always
+  // collapses to one object rather than leaking a metadata-bearing original
+  // under a different hash.
+  const sha256 = sha256Hex(sanitized);
+  const path = buildObjectPath(scope.orgId, scope.userId, sha256);
+  await deps.storageRepo.upload(path, sanitized, 'image/png');
+
+  const promptHistory: PromptHistoryEntry[] = [
+    { role: 'user', prompt: '(uploaded image)', timestamp: new Date(deps.now()).toISOString() },
+  ];
+
+  let sessionId: number | string;
+  try {
+    const row = await deps.imageSessionsRepo.create(scope.orgId, scope.userId, {
+      promptHistory,
+      currentPath: path,
+      source: 'uploaded',
+    });
+    sessionId = row.id;
+  } catch (err) {
+    // Compensate: don't leave an orphaned object if the DB write failed.
+    await deps.storageRepo.remove([path]).catch(() => {});
+    throw err;
+  }
+
+  await deps.orgUsageRepo.addStorageBytes(scope.orgId, sanitized.length);
+  assertPathInOrg(path, scope.orgId);
   const signedUrl = await deps.storageRepo.createSignedUrl(path);
   return { sessionId, path, signedUrl, promptHistory };
 }

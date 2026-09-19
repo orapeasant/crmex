@@ -58,20 +58,38 @@ export interface ClientRecipients {
   suppressedCount: number;
   /** Clients without a usable phone number. */
   noPhoneCount: number;
+  /** Clients hidden because they are not `active` (crmex.md §18.3.1) — inactive or archived. */
+  inactiveCount: number;
 }
 
 /**
- * Firm clients that may be offered as message recipients: a valid E.164
- * phone and not suppressed. Suppressed clients are excluded up front here;
- * buildQueue still enforces suppression structurally at send time.
+ * Firm clients that may be offered as message recipients: `active`, a valid
+ * E.164 phone, and not suppressed (crmex.md §18.3.1, §18.4 step 2). Inactive
+ * and archived clients are never offered at all, distinct from suppression —
+ * a client can be active and opted out, or inactive and never opted out —
+ * so each is counted separately rather than merged into one number. A client who
+ * is both counts once, as opted out. Both are re-checked at send/claim time.
  */
 export function clientRecipients(clients: ClientRow[]): ClientRecipients {
   const recipients: RecipientContact[] = [];
   let suppressedCount = 0;
   let noPhoneCount = 0;
+  let inactiveCount = 0;
   for (const c of clients) {
+    // Suppression is checked BEFORE status, so a client who is both opted out and
+    // inactive is reported as opted out. Two reasons, one label: the opt-out is the
+    // durable fact about the person, while the status is the firm's own filing that
+    // staff can undo. Labelling such a client "inactive" invites the reader to
+    // reactivate them and expect the message to go — it will not, because
+    // suppression blocks it independently. queueSendJob and the claim-time re-check
+    // in jobRunner order these the same way; all three must agree or the wizard and
+    // the queued result will name different reasons for the same person.
     if (c.suppressed_at) {
       suppressedCount++;
+      continue;
+    }
+    if (c.status !== 'active') {
+      inactiveCount++;
       continue;
     }
     const e164 = c.phone_e164 && /^\+[1-9][0-9]{6,14}$/.test(c.phone_e164) ? c.phone_e164 : null;
@@ -82,7 +100,7 @@ export function clientRecipients(clients: ClientRow[]): ClientRecipients {
     recipients.push({ id: c.id, clientId: c.id, displayName: c.display_name, e164, jid: jidFromE164(e164) });
   }
   recipients.sort((a, b) => a.displayName.localeCompare(b.displayName));
-  return { recipients, suppressedCount, noPhoneCount };
+  return { recipients, suppressedCount, noPhoneCount, inactiveCount };
 }
 
 /** JIDs of the firm's suppressed clients — the suppression list buildQueue enforces. */

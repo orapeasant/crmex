@@ -19,4 +19,6 @@ export const JOB_STATUS: Record<string, { label: string; className: string }> = 
   done: { label: 'Finished', className: 'badge badge--success' },
   cancelled: { label: 'Cancelled', className: 'badge badge--warning' },
   failed: { label: 'Failed', className: 'badge badge--danger' },
+  // crmex.md §16.4.1 / §18.3.2: past its late window and never claimed.
+  expired: { label: 'Expired — too late to send', className: 'badge badge--warning' },
 };

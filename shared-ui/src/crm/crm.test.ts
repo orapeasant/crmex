@@ -22,6 +22,7 @@ function clientRow(over: Partial<ClientRow>): ClientRow {
     opted_in_at: null,
     suppressed_at: null,
     source: 'manual',
+    status: 'active',
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     ...over,
@@ -103,6 +104,30 @@ describe('client helpers', () => {
     expect(res.recipients).toEqual([{ id: 'a', clientId: 'a', displayName: 'Alice Tan', e164: '+6591234567', jid: '6591234567@s.whatsapp.net' }]);
     expect(res.suppressedCount).toBe(1);
     expect(res.noPhoneCount).toBe(3);
+    expect(res.inactiveCount).toBe(0);
+  });
+
+  it('derives recipients: excludes inactive and archived clients, counted separately from opted-out (§18.3.1, CAM-16)', () => {
+    const res = clientRecipients([
+      clientRow({ id: 'a', display_name: 'Alice', phone_e164: '+6591234567', status: 'active' }),
+      clientRow({ id: 'b', display_name: 'Bob', phone_e164: '+6598765432', status: 'inactive' }),
+      clientRow({ id: 'c', display_name: 'Cara', phone_e164: '+6598765433', status: 'archived' }),
+      clientRow({ id: 'd', display_name: 'Dan', phone_e164: '+6598765434', status: 'active', suppressed_at: '2026-02-01T00:00:00Z' }),
+    ]);
+    expect(res.recipients.map((r) => r.id)).toEqual(['a']);
+    expect(res.inactiveCount).toBe(2);
+    expect(res.suppressedCount).toBe(1);
+    expect(res.noPhoneCount).toBe(0);
+  });
+
+  it('a client who is both opted out and inactive is reported as opted out, matching queueSendJob and jobRunner (§18.3.1)', () => {
+    // The opt-out is the person's standing instruction; the status is the firm's own
+    // filing. Counting them once, as opted out, keeps the wizard's summary consistent
+    // with the reason queueSendJob returns for the same client — and stops a reader
+    // concluding that reactivating them would let the message through.
+    const res = clientRecipients([clientRow({ id: 'x', display_name: 'X', phone_e164: '+6591111111', status: 'inactive', suppressed_at: '2026-02-01T00:00:00Z' })]);
+    expect(res.suppressedCount).toBe(1);
+    expect(res.inactiveCount).toBe(0);
   });
 
   it('builds the suppression jid set from suppressed_at', () => {

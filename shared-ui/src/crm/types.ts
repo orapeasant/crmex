@@ -10,6 +10,22 @@ export const CLIENT_KINDS: { value: ClientKind; label: string }[] = [
   { value: 'other', label: 'Other' },
 ];
 
+/**
+ * CRM lifecycle of the relationship (crmex.md §18.3.1), set by the firm.
+ * Deliberately separate from `suppressed_at`, which is the person's own
+ * opt-out (§12): a client can be active and opted out, or inactive and never
+ * opted out, and reactivating one must never resume messaging someone who
+ * asked you to stop. Campaigns target `active` only; both flags exclude, and
+ * the excluded line names them separately because a user who sees one count
+ * will assume the wrong reason.
+ */
+export type ClientStatus = 'active' | 'inactive' | 'archived';
+export const CLIENT_STATUSES: { value: ClientStatus; label: string }[] = [
+  { value: 'active', label: 'Active' },
+  { value: 'inactive', label: 'Inactive' },
+  { value: 'archived', label: 'Archived' },
+];
+
 export interface ClientRow {
   id: string;
   org_id: string;
@@ -23,6 +39,7 @@ export interface ClientRow {
   opted_in_at: string | null;
   suppressed_at: string | null;
   source: 'manual' | 'phone_import';
+  status: ClientStatus;
   created_at: string;
   updated_at: string;
 }
@@ -128,7 +145,7 @@ export interface OrgMemberRow {
   display_name: string | null;
 }
 
-export type SendJobStatus = 'queued' | 'claimed' | 'done' | 'cancelled' | 'failed';
+export type SendJobStatus = 'queued' | 'claimed' | 'done' | 'cancelled' | 'failed' | 'expired';
 
 export interface SendJobRecipient {
   client_id: string;
@@ -147,6 +164,30 @@ export interface SendJobRow {
   claimed_at: string | null;
   finished_at: string | null;
   error: string | null;
+  /**
+   * Campaign columns (crmex.md §18.3.2). All null on a job queued the
+   * pre-§18 way, which still means "run as soon as the phone sees it".
+   * Immutable after insert, like body and recipients — rescheduling is
+   * cancel-and-recreate, so one row is always one run.
+   */
+  scheduled_at: string | null;
+  interval_ms: number | null;
+  jitter_pct: number;
+  expires_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** A job is runnable when it is queued, due, and not past its window (§18.3.2). */
+export function isJobDue(job: SendJobRow, now: Date = new Date()): boolean {
+  if (job.status !== 'queued') return false;
+  const t = now.getTime();
+  if (job.scheduled_at && Date.parse(job.scheduled_at) > t) return false;
+  if (job.expires_at && Date.parse(job.expires_at) <= t) return false;
+  return true;
+}
+
+/** Past its window and still unclaimed: the phone reports it rather than sending late (§18.3.2). */
+export function isJobExpired(job: SendJobRow, now: Date = new Date()): boolean {
+  return job.status === 'queued' && job.expires_at !== null && Date.parse(job.expires_at) <= now.getTime();
 }

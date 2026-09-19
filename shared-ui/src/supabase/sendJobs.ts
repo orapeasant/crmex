@@ -5,7 +5,8 @@
 // status transitions (supabase/migrations/20260913000200_send_jobs.sql).
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { jidFromE164 } from '../contacts/normalize.js';
-import type { SendJobRecipient, SendJobRow, SendJobStatus } from '../crm/types.js';
+import { isJobDue, type SendJobRecipient, type SendJobRow, type SendJobStatus } from '../crm/types.js';
+import { DEFAULT_JITTER_PCT } from '../pacing/pacing.js';
 import { CrmPermissionError } from './crmRepo.js';
 
 export interface QueueSendJobInput {
@@ -15,12 +16,25 @@ export interface QueueSendJobInput {
   mediaPath?: string | null;
   /** Client ids the user confirmed in review. Phone numbers are re-read from the firm's clients, never taken from the caller. */
   clientIds: string[];
+  /** Campaign scheduling (crmex.md §18.3.2). All null/omitted means "run as soon as the phone sees it" — pre-§18 behaviour. */
+  scheduledAt?: string | null;
+  intervalMs?: number | null;
+  jitterPct?: number;
+  expiresAt?: string | null;
+}
+
+/** Why a selected client did not make it into a job's recipients (§18.3.1, §18.4). Reported separately, never merged into one count. */
+export type ExcludedReason = 'suppressed' | 'inactive' | 'no_phone' | 'not_found' | 'duplicate';
+
+export interface ExcludedClient {
+  clientId: string;
+  reason: ExcludedReason;
 }
 
 export interface QueuedJob {
   job: SendJobRow;
-  /** Selected clients left out because they opted out, lost their phone number or no longer exist. */
-  excludedClientIds: string[];
+  /** Selected clients left out, with the reason each was excluded (§18.3.1: opted out, inactive, no phone, gone, or a repeated id/number). */
+  excluded: ExcludedClient[];
 }
 
 const E164_RE = /^\+[1-9][0-9]{6,14}$/;
@@ -39,21 +53,39 @@ export async function queueSendJob(client: SupabaseClient, input: QueueSendJobIn
   if (!input.body?.trim() && !input.mediaPath) throw new Error('EMPTY_MESSAGE');
 
   // Fail closed: recipients are rebuilt from the firm's current client rows.
-  const { data, error } = await client.from('clients').select('id, display_name, phone_e164, suppressed_at').eq('org_id', input.orgId).in('id', ids);
+  // §18.3.1: a campaign targets active clients only, in addition to the existing exclusions.
+  const { data, error } = await client.from('clients').select('id, display_name, phone_e164, suppressed_at, status').eq('org_id', input.orgId).in('id', ids);
   if (error) throw error;
-  const found = new Map(((data ?? []) as { id: string; display_name: string; phone_e164: string | null; suppressed_at: string | null }[]).map((c) => [c.id, c]));
+  const found = new Map(
+    ((data ?? []) as { id: string; display_name: string; phone_e164: string | null; suppressed_at: string | null; status: string }[]).map((c) => [c.id, c]),
+  );
 
   const recipients: SendJobRecipient[] = [];
-  const excludedClientIds: string[] = [];
+  const excluded: ExcludedClient[] = [];
   const seenJids = new Set<string>();
   for (const id of ids) {
     const c = found.get(id);
-    if (!c || c.suppressed_at || !c.phone_e164 || !E164_RE.test(c.phone_e164)) {
-      excludedClientIds.push(id);
+    if (!c) {
+      excluded.push({ clientId: id, reason: 'not_found' });
+      continue;
+    }
+    if (c.suppressed_at) {
+      excluded.push({ clientId: id, reason: 'suppressed' });
+      continue;
+    }
+    if (c.status !== 'active') {
+      excluded.push({ clientId: id, reason: 'inactive' });
+      continue;
+    }
+    if (!c.phone_e164 || !E164_RE.test(c.phone_e164)) {
+      excluded.push({ clientId: id, reason: 'no_phone' });
       continue;
     }
     const jid = jidFromE164(c.phone_e164);
-    if (seenJids.has(jid)) continue;
+    if (seenJids.has(jid)) {
+      excluded.push({ clientId: id, reason: 'duplicate' });
+      continue;
+    }
     seenJids.add(jid);
     recipients.push({ client_id: c.id, jid, display_name: c.display_name });
   }
@@ -69,12 +101,16 @@ export async function queueSendJob(client: SupabaseClient, input: QueueSendJobIn
       body: input.body?.trim() || null,
       media_path: input.mediaPath ?? null,
       recipients,
+      scheduled_at: input.scheduledAt ?? null,
+      interval_ms: input.intervalMs ?? null,
+      jitter_pct: input.jitterPct ?? DEFAULT_JITTER_PCT,
+      expires_at: input.expiresAt ?? null,
     })
     .select('*');
   if (inserted.error) throw inserted.error;
   const job = ((inserted.data ?? []) as SendJobRow[])[0];
   if (!job) throw new CrmPermissionError();
-  return { job, excludedClientIds };
+  return { job, excluded };
 }
 
 export async function getSendJob(client: SupabaseClient, orgId: string, id: string): Promise<SendJobRow | null> {
@@ -108,7 +144,7 @@ export async function cancelSendJob(client: SupabaseClient, orgId: string, userI
   return row;
 }
 
-/** The caller's own queued jobs in the given firms, oldest first. */
+/** The caller's own queued, due jobs (§18.3.2: scheduled_at reached, not past expires_at) in the given firms, oldest first. */
 export async function listRunnableJobs(client: SupabaseClient, userId: string, orgIds: string[]): Promise<SendJobRow[]> {
   if (orgIds.length === 0) return [];
   const { data, error } = await client
@@ -119,7 +155,7 @@ export async function listRunnableJobs(client: SupabaseClient, userId: string, o
     .in('org_id', orgIds)
     .order('created_at', { ascending: true });
   if (error) throw error;
-  return (data ?? []) as SendJobRow[];
+  return ((data ?? []) as SendJobRow[]).filter((job) => isJobDue(job));
 }
 
 /**
@@ -128,6 +164,7 @@ export async function listRunnableJobs(client: SupabaseClient, userId: string, o
  * can never both run a job.
  */
 export async function claimSendJob(client: SupabaseClient, userId: string, job: Pick<SendJobRow, 'id' | 'org_id'>): Promise<SendJobRow | null> {
+  const now = new Date().toISOString();
   const { data, error } = await client
     .from('send_jobs')
     .update({ status: 'claimed' })
@@ -135,6 +172,10 @@ export async function claimSendJob(client: SupabaseClient, userId: string, job: 
     .eq('org_id', job.org_id)
     .eq('status', 'queued')
     .eq('created_by', userId)
+    // §18.3.2: re-evaluated by Postgres on the locked row, same as the trigger's own
+    // check — kept here too so the atomic update itself only ever claims a due, unexpired job.
+    .or(`scheduled_at.is.null,scheduled_at.lte.${now}`)
+    .or(`expires_at.is.null,expires_at.gt.${now}`)
     .select('*');
   if (error) throw error;
   const list = (data ?? []) as SendJobRow[];

@@ -25,6 +25,11 @@ export interface HistoryEntry {
   failed: number;
   /** send_jobs status when the batch was queued from a browser. */
   jobStatus: SendJobRow['status'] | null;
+  /** Campaign columns (crmex.md §18.3.2), carried through for the campaign list. Null on a plain immediate send or one with no send_jobs row. */
+  scheduledAt: string | null;
+  intervalMs: number | null;
+  jitterPct: number;
+  expiresAt: string | null;
 }
 
 /** Sent batches (message_history) merged with browser-queued send_jobs, newest first. */
@@ -37,7 +42,21 @@ export async function loadBatchHistory(supabase: SupabaseClient, orgId: string):
   ]);
   const entries = new Map<string, HistoryEntry>();
   for (const b of groupHistoryBatches(rows)) {
-    entries.set(b.batchId, { id: b.batchId, when: b.startedAt, senderId: b.senderId, body: b.body, hasMedia: Boolean(b.mediaPath), total: b.total, sent: b.sent, failed: b.failed, jobStatus: null });
+    entries.set(b.batchId, {
+      id: b.batchId,
+      when: b.startedAt,
+      senderId: b.senderId,
+      body: b.body,
+      hasMedia: Boolean(b.mediaPath),
+      total: b.total,
+      sent: b.sent,
+      failed: b.failed,
+      jobStatus: null,
+      scheduledAt: null,
+      intervalMs: null,
+      jitterPct: 25,
+      expiresAt: null,
+    });
   }
   for (const j of jobs) {
     const e = entries.get(j.id);
@@ -45,8 +64,26 @@ export async function loadBatchHistory(supabase: SupabaseClient, orgId: string):
       e.jobStatus = j.status;
       e.total = Math.max(e.total, j.recipients.length);
       e.when = j.created_at;
+      e.scheduledAt = j.scheduled_at;
+      e.intervalMs = j.interval_ms;
+      e.jitterPct = j.jitter_pct;
+      e.expiresAt = j.expires_at;
     } else {
-      entries.set(j.id, { id: j.id, when: j.created_at, senderId: j.created_by, body: j.body, hasMedia: Boolean(j.media_path), total: j.recipients.length, sent: 0, failed: 0, jobStatus: j.status });
+      entries.set(j.id, {
+        id: j.id,
+        when: j.created_at,
+        senderId: j.created_by,
+        body: j.body,
+        hasMedia: Boolean(j.media_path),
+        total: j.recipients.length,
+        sent: 0,
+        failed: 0,
+        jobStatus: j.status,
+        scheduledAt: j.scheduled_at,
+        intervalMs: j.interval_ms,
+        jitterPct: j.jitter_pct,
+        expiresAt: j.expires_at,
+      });
     }
   }
   return { entries: Array.from(entries.values()).sort((a, b) => b.when.localeCompare(a.when)), members };

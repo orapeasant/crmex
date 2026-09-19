@@ -10,6 +10,8 @@ export interface ContactsState {
   suppressedCount: number;
   /** Clients left out because they have no usable phone number. */
   noPhoneCount: number;
+  /** Clients left out because they are not `active` (§18.3.1) — inactive or archived, never offered at all. */
+  inactiveCount: number;
   error?: string;
 }
 
@@ -139,10 +141,18 @@ export function RecipientsStep({ contactsState, selectedIds, onChange, onRetry }
         </ul>
       )}
 
-      {(contactsState.suppressedCount > 0 || contactsState.noPhoneCount > 0) && (
+      {(contactsState.suppressedCount > 0 || contactsState.noPhoneCount > 0 || contactsState.inactiveCount > 0) && (
         <p className="faint">
-          Not shown:
-          {[contactsState.suppressedCount > 0 ? ` ${contactsState.suppressedCount} opted out of messages` : '', contactsState.noPhoneCount > 0 ? ` ${contactsState.noPhoneCount} without a mobile number` : ''].filter(Boolean).join(',')}.
+          {/* Named separately, never merged into one count (§18.3.1) — a user who sees a single number assumes the wrong reason. */}
+          Not shown:{' '}
+          {[
+            contactsState.suppressedCount > 0 ? `${contactsState.suppressedCount} opted out of messages` : '',
+            contactsState.inactiveCount > 0 ? `${contactsState.inactiveCount} inactive` : '',
+            contactsState.noPhoneCount > 0 ? `${contactsState.noPhoneCount} without a mobile number` : '',
+          ]
+            .filter(Boolean)
+            .join(' · ')}
+          .
         </p>
       )}
     </div>

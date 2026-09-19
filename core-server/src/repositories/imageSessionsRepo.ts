@@ -8,7 +8,7 @@ export interface ImageSessionRow {
   user_id: string | null;
   prompt_history: PromptHistoryEntry[];
   current_path: string | null;
-  source: 'generated' | 'searched';
+  source: 'generated' | 'searched' | 'uploaded';
   created_at: string;
   updated_at: string;
 }
@@ -16,7 +16,7 @@ export interface ImageSessionRow {
 export interface CreateImageSessionInput {
   promptHistory: PromptHistoryEntry[];
   currentPath: string;
-  source: 'generated' | 'searched';
+  source: 'generated' | 'searched' | 'uploaded';
 }
 
 /**

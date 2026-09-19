@@ -1,9 +1,54 @@
+import { crc32 } from 'zlib';
+import { createHash } from 'crypto';
 import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { buildTestApp as rawBuildTestApp, firmAuth, ORG_A, ORG_B, seedFirm } from '../helpers/buildTestApp';
 import { createFakeImageGenProvider } from '../../src/providers/image-gen/fake';
 import { createFakeImageSearchProvider } from '../../src/providers/image-search/fake';
 import { makeFakeToken } from '../fakes/fakeSupabaseClient';
+
+// --- Minimal PNG fixtures for CAM-15 (upload) tests -------------------------
+
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const typeAndData = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(typeAndData) >>> 0, 0);
+  return Buffer.concat([length, typeAndData, crc]);
+}
+
+function ihdrChunk(width = 1, height = 1): Buffer {
+  const data = Buffer.alloc(13);
+  data.writeUInt32BE(width, 0);
+  data.writeUInt32BE(height, 4);
+  data[8] = 8;
+  data[9] = 6;
+  return pngChunk('IHDR', data);
+}
+
+/** A structurally valid, minimal PNG — no ancillary chunks. */
+function validPng(): Buffer {
+  return Buffer.concat([PNG_MAGIC, ihdrChunk(), pngChunk('IDAT', Buffer.from([1, 2, 3])), pngChunk('IEND', Buffer.alloc(0))]);
+}
+
+/** A PNG carrying an eXIf chunk with a GPS-looking payload (CAM-15). */
+function pngWithGpsExif(): Buffer {
+  const gps = Buffer.from('Exif\0\0GPS 37.7749 N, 122.4194 W', 'utf8');
+  return Buffer.concat([
+    PNG_MAGIC,
+    ihdrChunk(),
+    pngChunk('eXIf', gps),
+    pngChunk('IDAT', Buffer.from([1, 2, 3])),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
 
 // Every test user belongs to a firm (crmex.md §15): u1 / A / user-a in Firm A, u2 / B in Firm B.
 function buildTestApp(opts?: Parameters<typeof rawBuildTestApp>[0]) {
@@ -172,5 +217,111 @@ describe('image generation, refinement and search', () => {
 
     expect(res.status).toBe(200);
     expect(imageGenProvider.generateCalls.at(-1)).toBe('a red bicycle. Refinement: make it blue');
+  });
+});
+
+describe('CAM-15: POST /api/v1/images/upload (paste or attach, crmex.md §18.4)', () => {
+  it('stores a pasted PNG under <org>/<user>/<sha256(sanitized)>.png, creates an image_sessions row, and returns a signed URL', async () => {
+    const { app, db } = buildTestApp();
+    const png = validPng();
+
+    const res = await request(app)
+      .post('/api/v1/images/upload')
+      .set(authFor('u1'))
+      .set('Content-Type', 'image/png')
+      .send(png);
+
+    expect(res.status).toBe(200);
+    expect(res.body.path).toBe(`${ORG_A}/u1/${sha256Hex(png)}.png`);
+    expect(res.body.signedUrl).toContain(res.body.path);
+    expect(db.storage.has(res.body.path)).toBe(true);
+    const row = db.tables.image_sessions.find((r) => r.id === res.body.sessionId)!;
+    expect(row.source).toBe('uploaded');
+    expect(row.current_path).toBe(res.body.path);
+  });
+
+  it('strips an eXIf chunk carrying GPS text before storing, and the stored path reflects the stripped bytes', async () => {
+    const { app, db } = buildTestApp();
+    const dirty = pngWithGpsExif();
+
+    const res = await request(app).post('/api/v1/images/upload').set(authFor('u1')).set('Content-Type', 'image/png').send(dirty);
+
+    expect(res.status).toBe(200);
+    // The path hashes the SANITIZED bytes, not the uploaded ones, so it must
+    // differ from a hash of the dirty input and match the clean fixture's hash.
+    expect(res.body.path).not.toBe(`${ORG_A}/u1/${sha256Hex(dirty)}.png`);
+    expect(res.body.path).toBe(`${ORG_A}/u1/${sha256Hex(validPng())}.png`);
+
+    const storedRaw = (db.storage.get(res.body.path) as { bytes: Buffer } | undefined)?.bytes;
+    expect(storedRaw).toBeDefined();
+    expect(storedRaw!.toString('latin1')).not.toContain('GPS');
+    expect(storedRaw!.includes(Buffer.from('eXIf'))).toBe(false);
+  });
+
+  it('rejects a non-PNG body (e.g. a JPEG)', async () => {
+    const { app, db } = buildTestApp();
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+
+    const res = await request(app).post('/api/v1/images/upload').set(authFor('u1')).set('Content-Type', 'image/jpeg').send(jpeg);
+
+    expect(res.status).toBe(400);
+    expect(db.tables.image_sessions).toHaveLength(0);
+    expect(db.storage.size).toBe(0);
+  });
+
+  it('rejects an oversized body', async () => {
+    const { app, db } = buildTestApp();
+    db.seed('app_settings', { key: 'quota.max_upload_bytes', value: 100 });
+    const big = Buffer.concat([validPng(), Buffer.alloc(200, 0)]);
+
+    const res = await request(app).post('/api/v1/images/upload').set(authFor('u1')).set('Content-Type', 'image/png').send(big);
+
+    expect(res.status).toBe(413);
+    expect(db.tables.image_sessions).toHaveLength(0);
+    expect(db.storage.size).toBe(0);
+  });
+
+  it('ignores a client-supplied path/filename in the body or query — the path is always built from the JWT', async () => {
+    const { app, db } = buildTestApp();
+    const png = validPng();
+
+    const res = await request(app)
+      .post('/api/v1/images/upload?path=../evil/hacked.png&filename=hacked.png')
+      .set(authFor('u1'))
+      .set('Content-Type', 'image/png')
+      .send(png);
+
+    expect(res.status).toBe(200);
+    expect(res.body.path).toBe(`${ORG_A}/u1/${sha256Hex(png)}.png`);
+    expect(res.body.path).not.toContain('evil');
+    expect(res.body.path).not.toContain('hacked');
+    expect(db.storage.has(res.body.path)).toBe(true);
+  });
+
+  it('quota exceeded (storage ceiling) rejects the upload', async () => {
+    const { app, db } = buildTestApp();
+    db.seed('app_settings', { key: 'quota.default_storage_bytes', value: 1 });
+    db.seed('org_usage_daily', { org_id: ORG_A, day: '2026-01-01', storage_bytes: 100, images_generated: 0, messages_drafted: 0, messages_sent: 0 });
+
+    const res = await request(app).post('/api/v1/images/upload').set(authFor('u1')).set('Content-Type', 'image/png').send(validPng());
+
+    expect(res.status).toBe(429);
+    expect(res.body.error.code).toBe('QUOTA_EXCEEDED');
+    expect(db.storage.size).toBe(0);
+  });
+
+  it('a member of another firm cannot upload into this firm\'s path (forged X-Org-Id is 403, not routed to Firm A\'s prefix)', async () => {
+    const { app, db } = buildTestApp();
+
+    // u2 is only a member of ORG_B; forging X-Org-Id: ORG_A must not succeed.
+    const res = await request(app)
+      .post('/api/v1/images/upload')
+      .set({ Authorization: `Bearer ${makeFakeToken({ sub: 'u2' })}`, 'X-Org-Id': ORG_A, 'Content-Type': 'image/png' })
+      .send(validPng());
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('NOT_A_MEMBER');
+    expect(db.storage.size).toBe(0);
+    expect(db.tables.image_sessions).toHaveLength(0);
   });
 });

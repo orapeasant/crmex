@@ -28,7 +28,9 @@ export interface BuildQueueOptions {
 export interface SkippedEntry {
   jid: string;
   displayName: string;
-  reason: 'NOT_CONFIRMED' | 'SUPPRESSED' | 'NOT_ON_WHATSAPP' | 'DUPLICATE';
+  /** INACTIVE is never produced by buildQueue itself — the caller filters clients.status
+   * before candidates are built (§18.3.1) and reports them under this reason. */
+  reason: 'NOT_CONFIRMED' | 'SUPPRESSED' | 'NOT_ON_WHATSAPP' | 'DUPLICATE' | 'INACTIVE';
 }
 
 export interface BuiltQueue {
