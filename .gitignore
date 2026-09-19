@@ -71,8 +71,3 @@ Desktop.ini
 # --- Logs ---
 logs/
 *.log
-
-
-#doc
-*.md
-!README.md
