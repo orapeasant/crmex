@@ -1547,6 +1547,8 @@ Pacing math stays in `shared-ui/src/pacing/pacing.ts`: a campaign is just a `Pac
 
 **Interruption.** A 3-hour run will outlive a `dataSync` foreground service's 6-hour cap only rarely, but it will certainly meet OEM battery kills (§10.2). The run is resumable because `outbox` holds every unsettled recipient (§9.2), and resumption is the existing path: on launch, unsettled rows for a `claimed` job are re-offered. A job that is `claimed` with unsettled `outbox` rows and no running batch is shown as **Paused — resume**, never silently restarted, because the claimed-but-unsettled row may already have been delivered (§9.2).
 
+**Two campaigns due at once (decided 2026-09-19).** They **interleave**, sharing the pacing floor between any two messages, so neither waits for the other to finish — except a campaign of **fewer than 20 recipients**, which is instead **started 1–2 minutes later** than the campaign it collided with. The split is deliberate: a short run finishes quickly, so delaying it costs almost nothing and keeps its stated pacing exactly true, while making a 400-recipient campaign wait three hours for another one is not a real option. Interleaving is what makes the stated interval a floor rather than a promise, which is why the estimate is presented the way §18.4 step 5 describes.
+
 **Progress** is derived, not stored: `message_history` rows carrying `batch_id = job.id` give sent/failed/skipped counts, and the browser watches them over Realtime. No counter column, so a phone that dies mid-run cannot leave a lying number behind.
 
 ### 18.6 What the browser can do
@@ -1556,13 +1558,32 @@ Create, watch and cancel. It cannot send.
 - Create a campaign, scheduled or immediate — the phone runs both.
 - See every campaign in the firm (RLS: firm members read the firm's jobs), with status, schedule, pace and live per-recipient results.
 - Cancel while `queued` (creator only, existing policy). A `claimed` campaign cannot be cancelled from the browser — the phone is mid-run and owns it; the phone's own UI stops it.
-- The campaign list must say plainly, per §15.10, that a scheduled campaign runs **only while the creator's phone is online with CRMEX running**, and it shows which phone (last-seen) so the claim is checkable rather than hopeful.
+- The campaign list must say plainly, per §15.10, that a scheduled campaign runs **only while the creator's phone is online with CRMEX running**, and it shows when that phone was last seen so the claim is checkable rather than hopeful.
+
+**Device presence (decided 2026-09-19).** The phone is positioned as an always-on gateway, so "will it actually run?" has to be answerable before the scheduled time, not discovered afterwards:
+
+```text
+device_presence
+  user_id uuid, device_id text          -- primary key (user_id, device_id)
+  label text                            -- "Pixel 8", chosen on the device
+  last_seen_at timestamptz not null
+  app_version text
+```
+
+The phone upserts `last_seen_at` while running (on launch, resume, and on the job-poll tick). RLS: a user reads and writes **their own** rows. Fellow firm members may read `last_seen_at` for a user they share a firm with, so the campaign list can say "last seen 2 minutes ago" — but **not** `label` or `app_version`, which describe the person's hardware rather than the firm's work (§15.5). The list shows the creator's most recent device.
+
+The UI distinction that matters is between *"will run"* and *"will probably not run"*: a phone last seen minutes ago is a live gateway, one last seen three days ago means the campaign is almost certainly going to expire, and the user should be told that **while scheduling**, not after.
+
+**Direction (decided 2026-09-19): the server will drive the schedule; the phone stays a gateway.** Today the phone decides when a job is due (it polls and claims once `scheduled_at` passes). The intended end state is the §16.6 dispatcher deciding "this is due" and the phone only executing, which is also what §18.9's push wake-up needs. That dispatcher is built **with §16**, not before it, because §16 needs the same tick and building it twice would be waste. Nothing in §18.3 changes when it arrives: the atomic claim is still what prevents two devices running one job, and the trigger still enforces the window — a server-side dispatcher shortens the delay before a claim, it does not become a second sender.
 
 ### 18.7 Limits and safety
 
 - `limits.max_batch_recipients` is checked in the UI, re-checked at claim time (already in `jobRunner.ts`), and is the reason **Select all** shows a count first.
 - The pacing floor is a firm setting, not a user choice: a user can slow a campaign down but not speed it past `pacing.min_interval_ms`.
 - Suppression (§12, opt-out) and `status` (§18.3.1) each exclude at selection *and* at claim, and are reported as distinct reasons. Unregistered numbers resolve to `SKIPPED`, not `FAILED` (§7.3).
+- **Recipient overlap between campaigns (decided 2026-09-19).** At schedule time the wizard counts recipients this campaign shares with other campaigns due **on the same day in the firm's timezone**. Above **10 %** of the new campaign's recipients, it warns — "Of 412 recipients, 58 (14 %) are also in *Autumn newsletter* today" — and offers **Remove those recipients**, **Reschedule**, or **Send anyway**. At or below 10 % it says nothing, because a warning that fires constantly is a warning nobody reads.
+
+  It **warns, never auto-excludes**. Two different messages to one client on one day is sometimes exactly right (a hearing reminder and a firm announcement), and silently dropping recipients would mean the user approved a list that is not the list that went out — the same objection that makes §18.3's frozen snapshot worth having. §19.6 treats a campaign colliding with an occasion rule the same way, and for the same reason.
 - One image and one body per campaign. Per-recipient variation beyond `{name}` is out of scope; it multiplies the review surface and is the shape that turns this into a spam tool.
 - Quotas count a campaign's messages the same as manual ones (`usage_daily`, `org_usage_daily`).
 
@@ -1572,8 +1593,9 @@ Create, watch and cancel. It cannot send.
 | :--- | :--- | :--- | :--- |
 | **C-D1** | Default interval preset | 10 s / 30 s / 60 s | **Decided 2026-09-18: 30 s**, with 10 s seeded as `pacing.min_interval_ms`. The current global window is 7–18 s, which is fine for a handful of recipients and aggressive for 400. |
 | **C-D2** | Campaign size ceiling | reuse `limits.max_batch_recipients` / a separate, lower campaign cap | **Decided 2026-09-18: reuse it.** One number to reason about. |
-| **C-D3** | Two campaigns due at the same time on one phone | run sequentially / refuse to schedule an overlap / run and let pacing interleave | **Sequentially**, by claim order. Interleaving two paced runs makes both effective rates wrong. |
-| **C-D4** | `{name}` fallback when a client has no display name | skip the recipient / render empty / render a generic word | **Render the client's phone-book name, else skip the recipient** and report it in the excluded line. A message opening "Hi ," is worse than not sending. |
+| **C-D3** | Two campaigns due at the same time on one phone | run sequentially / refuse to schedule an overlap / run and let pacing interleave | **Decided 2026-09-19: interleave**, sharing the pacing floor — except a campaign under 20 recipients, which is started 1–2 min later instead (§18.5). |
+| **C-D4** | `{name}` fallback when a client has no display name | — | **Closed 2026-09-19 as moot.** `clients.display_name` is `not null` with a 1–200 character check, and recipients are built from that column, so a campaign recipient always has a non-empty name. No fallback is reachable. |
+| **C-D6** | A client appearing in two campaigns due the same day | warn / block / auto-exclude | **Decided 2026-09-19: warn above 10 % overlap** and let the user remove, reschedule or proceed (§18.7). Never auto-exclude — the approved list must be the list that sends. |
 | **C-D5** | Editing a scheduled campaign | cancel-and-recreate only / allow editing body before `scheduled_at` | **Decided 2026-09-18: cancel-and-recreate** (§18.3), enforced by the trigger's immutability check rather than only by the absence of an edit button. |
 
 ### 18.9 Deferred — server-side wake-up
@@ -1593,7 +1615,10 @@ Until then, `expires_at` is what keeps a late campaign from going out at the wro
 3. **Wizard steps 4–5** in `shared-ui` — image source picker, schedule and pace screen with the duration estimate.
 4. **`jobRunner.ts`** — time-aware `listRunnableJobs`, per-job pacing window, expired handling, the Paused/resume state.
 5. **Campaign list** — status, derived progress, cancel — in both shells.
-6. **FCM wake-up** (§18.9), separately.
+6. **`device_presence`** (§18.6) — the heartbeat, its RLS, and the "last seen" line in the campaign list.
+7. **Collision and overlap** (§18.5, §18.7) — the under-20 stagger and the same-day recipient-overlap warning.
+8. **Server-side dispatcher** — with §16, not before it.
+9. **FCM wake-up** (§18.9), separately.
 
 Test cases get IDs `CAM-*` in `test-plan.md` §21 once this section is approved.
 
