@@ -392,6 +392,11 @@ verify pacing and volume by asserting on timing and queue state, not by sending 
 
 ## 10. Dev workflow
 
+- **There are two checkouts.** This WSL one (`~/app/claude/crmex`) has no
+  `android/node_modules`; the Windows one (`/mnt/c/Users/orape/app/crmex`, reachable from WSL
+  under `/mnt/c`) does, because that is where Gradle runs. Anything needing plugin sources or
+  an Android build reads from the Windows copy — and the two can drift, so check which one a
+  commit came from before assuming the tree is current.
 - **Bring up the Android emulator from this Windows machine** (not WSL) whenever Android
   work needs a device. Android Studio, Gradle, `adb` and the emulator all run on Windows;
   see `android/README.md` for the build and install commands.
@@ -418,7 +423,8 @@ Triaged 2026-09-19. Outcomes recorded inline.
    one permission alias and Capacitor refuses the alias request unless both are declared, so
    removing it would break contact import. The reason now lives in §10.1 as well as the
    manifest comment, because it is the permission a Play reviewer is most likely to query.
-   (Not verified against plugin source — `android/node_modules` is not installed here.)
+   Verified 2026-09-19 against `ContactsPlugin.java`:
+   `@Permission(strings = { READ_CONTACTS, WRITE_CONTACTS }, alias = "contacts")`.
 3. `@capacitor/local-notifications` declared but unused — **keep.** §16.6.2 makes it the
    phase-1 staff-reminder channel and §16 stage 1 is the next build step, so removing it now
    only to re-add it is churn. Revisit if §16 slips.

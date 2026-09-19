@@ -509,7 +509,9 @@ Fixed by the §9.2 design, but recorded so they are not reintroduced:
          alias request unless every permission in it is in the manifest. Removing
          it breaks contact import. It is also the permission a Play reviewer is
          most likely to ask about, so the reason is recorded here rather than
-         only in a manifest comment. -->
+         only in a manifest comment. Verified against the plugin source
+         (ContactsPlugin.java: @Permission(strings = { READ_CONTACTS,
+         WRITE_CONTACTS }, alias = "contacts")) on 2026-09-19. -->
     <uses-permission android:name="android.permission.WRITE_CONTACTS" />
     <uses-permission android:name="android.permission.INTERNET" />
 
