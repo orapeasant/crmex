@@ -1575,7 +1575,7 @@ Create, watch and cancel. It cannot send.
 
 - Create a campaign, scheduled or immediate — the phone runs both.
 - See every campaign in the firm (RLS: firm members read the firm's jobs), with status, schedule, pace and live per-recipient results.
-- Cancel while `queued` (creator only, existing policy). A `claimed` campaign cannot be cancelled from the browser — the phone is mid-run and owns it; the phone's own UI stops it.
+- Cancel while `queued` (creator only, existing policy). ~~A `claimed` campaign cannot be cancelled from the browser — the phone is mid-run and owns it; the phone's own UI stops it.~~ **Superseded 2026-09-19 by §23.4:** a `claimed` campaign can be cancelled from the browser or the phone as a *request* (`cancel_requested_at`) that the phone honours before its next send; the creator, owners and admins may do it (this also supersedes "creator only"); unsent recipients end as `CANCELLED`, and sent messages stay sent.
 - The campaign list must say plainly, per §15.10, that a scheduled campaign runs **only while the creator's phone is online with CRMEX running**, and it shows when that phone was last seen so the claim is checkable rather than hopeful.
 
 **Device presence (decided 2026-09-19).** The phone is positioned as an always-on gateway, so "will it actually run?" has to be answerable before the scheduled time, not discovered afterwards:
