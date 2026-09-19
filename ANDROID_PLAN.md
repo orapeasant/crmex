@@ -4,6 +4,8 @@ The Android slice of CRMEX, extracted from `docs/spec/crmex.md` (§ references b
 `docs/spec/test-plan.md`, `PLAN.md`, `android/README.md`, and a check of the code in
 `android/` and `shared-ui/`. Written 2026-09-19.
 
+**Split of plans:** `PLAN.md` covers `core-server`, `shared-ui`, `web-ui` and `supabase/` only; **this file holds everything specific to the Android app.** Work that needs both (the assistant, the composer) has its server/shared half in `PLAN.md` and its phone half here.
+
 **This file is derived, not a new source of truth.** If it disagrees with `crmex.md`,
 the spec wins — fix this file. Scope or decision changes go into `crmex.md`, `test-plan.md`
 and `PLAN.md` first (project rule), then here.
@@ -289,6 +291,39 @@ Server-side (`core-server` → gyrfalcon). Android inherits any chat UI from `sh
 found no Android-specific requirements in the parts of §17 I searched (I did not read it in
 full).
 
+### 4.7 Voice — §21, merged into the assistant by §22
+Android implementation (the browser's Web Speech API version is in `PLAN.md` step 20). **Guided mode** (no AI, no server call, works offline) stays as designed in §21.4.
+**Smart mode is replaced by the assistant** (§4.8): a recording is transcribed on the phone and sent
+as a prompt to `POST /assistant/runs`; the dedicated voice-draft endpoint no longer exists.
+Needs a **speech spike on the P30 Pro first**: `@capacitor-community/speech-recognition` 7.0.1 vs
+Capacitor 8.5.2 (unproven), or a custom `SpeechRecognizerPlugin` like the four existing Java
+plugins; new `RECORD_AUDIO` permission and a `<queries>` entry for `android.speech.RecognitionService`.
+The phone has Google's recognizer (`googlequicksearchbox`); the **emulator has none**, so speech can
+only be tested on the phone. Audio may reach Google's servers unless offline recognition applies; an
+owner switch requires on-device-only (API 33+; the P30 Pro is API 29, so it would disable voice there).
+Languages: English, Malay, Mandarin, one per recording.
+
+**Decided 2026-09-19:** community plugin only (V-D2). If the spike fails on Capacitor 8, stop and ask — no custom plugin without a new decision. Best-effort on-device with an owner switch (V-D1); Mandarin only (V-D4); replies read aloud only if a member turns the speaker on (V-D3).
+
+### 4.8 The assistant on Android — §22
+The server half (engine adapter, settings, executor, read tools, kill switches) is `PLAN.md` step 20.
+Phone half:
+- **Assistant sheet:** streams text over SSE, renders **result cards** ("Created client … · Open", Confirm / Reject for Ask, Undo for Auto), and learns of created rows over Supabase Realtime plus the existing `bump()` refetch. Recovers when SSE drops.
+- **Entry points:** a floating assistant button on every main screen; the sheet inside Messages Compose; contextual on matter and client detail; **New by voice** on the Clients, Matters and Tasks lists.
+- **Disabled state:** call `GET /assistant/status`; on `AI_DISABLED`, keep the button but show *"AI is turned off by your firm owner"* or *"AI is temporarily unavailable"*. Manual entry, Guided voice and the composer keep working.
+- **Agent setup screens** (Settings → AI assistant): owner sections and member preferences per §22.6. **Design only for now — not to be built before approval.**
+- **Inbox:** an inbox row with a badge. **No push and no local notification for agent runs** (decided 2026-09-19); results are seen when the app is opened.
+- Nothing on the device holds a model key; the model is chosen server-side per firm.
+
+### 4.9 Composer, schedule step and cancel on Android — §23
+The server/shared half is `PLAN.md` step 21. Phone half:
+- **Cancel path in `jobRunner.ts`:** watch `send_jobs` over Realtime; **check `cancel_requested_at` before every send**; on request, stop, set the remaining `outbox` rows to a new `CANCELLED`, write `CANCELLED` to `message_history` for the unsent, and finish the job `cancelled` with honest counts. At most one message may complete after the request.
+- **Never resume** a job that has `cancel_requested_at` — relaunch and "Paused — resume" both skip it.
+- **Offline phone:** the request stays pending; the UI says "Cancel requested — waiting for the phone".
+- **Composer** (Compose · Schedule · Review) and **Drafts** are shared UI; on Android, leaving asks Save draft / Discard / Keep editing, and the Schedule stop shows which phone will send and its last-seen time.
+- **Draft edit lock:** take the edit lease when a draft opens, renew it every 30 s, show read-only with **Take over** when another device holds it, and let it expire on its own if the phone dies.
+- **New device tests:** MSG-03, MSG-08, MSG-16..18, MSG-22, MSG-23, MSG-27 (test plan §25).
+
 ---
 
 ## 5. Roadmap (Android view)
@@ -308,6 +343,9 @@ Ordered by what unblocks the most; A1 is the only real gate.
 | A9 | Reminder client messages (§4.2) | A8; §16.10 step 21 | |
 | A10 | Occasion-rule approval path (§4.4) | A9; §19 build steps | Minimal Android work |
 | A11 | Reliable staff channel — email or FCM (§16.13 D1, §18.9) | Decision D1 | Email is the recommendation; FCM later |
+| A12 | **Voice** (§4.7): speech spike on the phone, then Guided mode; recording feeds the assistant (A13) | Spec §21 approval; PLAN step 19 (numbering) | Smart mode is replaced by A13 |
+| A13 | **Assistant sheet, entry points, disabled state, inbox** (§4.8) | Spec §22 approval; PLAN step 20 server half | Agent setup screens: design only for now |
+| A14 | **Composer phone path: draft rendering, Schedule stop, cancel-before-next-send** (§4.9) | Spec §23 approval; PLAN step 21 server/shared half | Replaces the old §18.6 rule |
 
 `PLAN.md` step 16 (§18 campaigns) is **built** as of 2026-09-19, apart from the phone-side
 items in §4.3 and with the migration not yet applied. Steps 17 (§16 stage 1) and 18 (§19) are
@@ -358,6 +396,9 @@ verify pacing and volume by asserting on timing and queue state, not by sending 
 | Where the campaign schedule is driven from | §18.6 | **Decided 2026-09-19** — server-side dispatcher, built with §16; phone stays a gateway |
 | §16 scope and ordering | `PLAN.md` step 17 | **Decided 2026-09-19** — staged: `events` + `event_reminders` + dispatcher tick first; templates, move functions and overdue sweep deferred |
 | Occasion rules O-D1..O-D5 | §19.7 | Open |
+| Voice V-D1..V-D5, V-D7 (best-effort on-device + owner switch; community plugin only; text by default; Mandarin only; browser voice yes; `source='voice'`) | §21.9 | **Decided 2026-09-19**; V-D6 and V-D8 superseded by §22 |
+| Assistant AG-D5 (completion alert when the app is closed) | §22.14 | **Decided 2026-09-19: inbox only, never push** |
+| Composer MSG-D1..D7 (3 stops; leased edit lock; `CANCELLED`; 30 min dead-phone cancel; duplicate; `pg_trgm`; creator + owner see drafts) | §23.6 | **Decided 2026-09-19** |
 
 ---
 
@@ -436,3 +477,43 @@ Triaged 2026-09-19. Outcomes recorded inline.
 5. `minSdk` 24 vs the API 29 test device — **open, needs a product decision.** See §7.
 6. ~~`PLAN.md` §3 still lists campaign scheduling as out of scope~~ — **fixed** for the
    campaign half; "push reminders" stays until §16 stage 1 lands.
+
+---
+
+## 12. Moved from PLAN.md (original Android build order and decisions)
+
+These were in `PLAN.md` before it was limited to non-Android work. Step numbers match `PLAN.md`.
+
+### Original build steps
+
+0. **De-risk first — nodejs-mobile spike.** Build the Node payload with Baileys for `arm64-v8a`, deploy to the Huawei P30 Pro, confirm the socket pairs by QR and stays connected. Everything below assumes this works; if it doesn't, the architecture needs rethinking, so do not build UI before this passes.
+1. **Scaffold** — Capacitor Android project, Node payload skeleton with the IPC bridge, Supabase project with `message_history`/`image_sessions`/`contact_meta` + RLS policies, the private `user-images` Storage bucket + folder-prefix policies, and local SQLite (`outbox`, `image_cache`).
+2. **Auth** — Supabase Google provider; native Google Sign-In → `supabase.auth.signInWithIdToken` on Android; gate the app behind a session; `core-server` JWT middleware.
+3. **WhatsApp core** — Baileys socket in Node with QR delivery and reconnect-with-backoff; the WebView-owned `outbox` durability loop (write PENDING → hand to Node → persist each result → mirror to Supabase).
+4. **Contacts + NL matching** — contacts read with real E.164 normalization via `libphonenumber-js` and a `needsReview` bucket; SIM-region default with user override; `onWhatsApp()` registration check; `contactMatcher` on `core-server`.
+6. **Photo library save** — `NativeBridge.saveImageToLibrary` via MediaStore insert (a plain file write will not appear in Gallery).
+8. **Hardening** — reconnect/offline states, provider failures, the claimed-but-unsettled duplicate-send prompt, foreground-service lifecycle, Huawei battery-whitelist prompt, image generation cost caps.
+19. **Voice matter capture (§21, after approval, needs §20)** — speech spike on the P30 Pro first, then `create_matter_bundle`, Guided mode + on-device client matching + review screen, then `POST /matters/voice-draft` and Smart mode, then owner voice settings. Android only.
+
+Status: steps 0–7 were recorded as done on the emulator (send wizard verified end to end). Step 0 on the **physical device** was re-run on 2026-09-19: the payload loads on the P30 Pro, Baileys connects and a QR reaches the app; real pairing, background behaviour and the rest of the device checklist are still open (§2). The old step 19 (voice) is superseded by §4.7–§4.8.
+
+### Architecture decisions (Android)
+
+- **Android-first**: all core logic (LLM calls, image gen/search, contact matching, WhatsApp queue) lives in the Android app's embedded Node background engine. Web/Electron are future thin reuse targets via a shared UI layer — not built in this pass.
+- **Local SQLite is durability and cache-index only**, not a source of truth: `outbox` so a batch survives an app kill, `image_cache` to track downloads. The WhatsApp `useMultiFileAuthState` folder is also device-local — a session is cryptographically bound to one device pairing.
+- **Embedded Node does Baileys and nothing else**: no `sqlite3` (removes the native-module build risk), and **no local HTTP server** — the old localhost Express design bound to `0.0.0.0` and was reachable by anyone on the same Wi-Fi. Replaced by the `capacitor-nodejs` IPC bridge, which has no listening port.
+
+Note: the first bullet is historical — LLM calls, image generation/search and contact matching now live in `core-server`, not in the embedded Node engine.
+
+### Feature scope items that are Android-only
+
+- Natural-language contact search over the phone's local address book (read via `@capacitor-community/contacts` or equivalent).
+- Save current image to the device photo library.
+- Select contacts (from NL match results) + send image/text via the embedded Baileys WhatsApp engine, with paced/sequential delivery.
+- Send queue and image session history persisted in Supabase (source of truth); a local SQLite outbox absorbs sends mid-flight so the app survives being backgrounded/restarted or losing connectivity.
+
+### Decisions that are Android-only
+
+- **Google Play vs sideload.** Play needs a current `targetSdk`, blocks `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` without an exemption, and its policy is hostile to WhatsApp bulk-messaging apps. Resolve before building if Play is the target.
+- SIM-region detection needs a small custom Capacitor plugin (`TelephonyManager.getSimCountryIso()`) or an accepted fallback to device locale.
+- **Voice matter capture** (`crmex.md` §21, designed 2026-09-19; **V-D1..V-D5 and V-D7 decided 2026-09-19**, see §7; the original question was **V-D1** (the stock Google recognizer may send audio to Google unless an offline pack is used; the test phone is API 29 and cannot use the guaranteed on-device recognizer) and **V-D2** (community speech plugin vs custom Java plugin on Capacitor 8). Languages: English, Malay, Mandarin.

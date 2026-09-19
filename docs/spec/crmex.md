@@ -1249,7 +1249,7 @@ The `SCH-*` cases live in `test-plan.md` §19.
 
 ## 17. Agentic engine — gyrfalcon integration
 
-**Status: designed 2026-09-17, under review; not implemented.** Open decisions are in §17.10.
+**Status: designed 2026-09-17, under review; not implemented.** Open decisions are in §17.10. **Amended 2026-09-19 by §22:** gyrfalcon never writes but `core-server`'s executor does, per the owner's autonomy matrix; read tools are now required (so G4 and G2 become prerequisites for real firm data); and G7 is added.
 
 Gyrfalcon is a self-hosted Python agent platform. On the dev machine it lives in WSL at `/home/ubuntu/agent/gyrfalcon`, and its own specs are in `docs/spec/gyrfalcon/`. It provides three capabilities CRMEX wants:
 
@@ -1569,11 +1569,13 @@ Pacing math stays in `shared-ui/src/pacing/pacing.ts`: a campaign is just a `Pac
 
 ### 18.6 What the browser can do
 
+> **Amended 2026-09-19 by §23.4:** a `claimed` campaign *can* now be cancelled from the browser or the phone, as a request the phone honours before its next send. The rule below about `claimed` campaigns is superseded; everything else stands.
+
 Create, watch and cancel. It cannot send.
 
 - Create a campaign, scheduled or immediate — the phone runs both.
 - See every campaign in the firm (RLS: firm members read the firm's jobs), with status, schedule, pace and live per-recipient results.
-- Cancel while `queued` (creator only, existing policy). A `claimed` campaign cannot be cancelled from the browser — the phone is mid-run and owns it; the phone's own UI stops it.
+- Cancel while `queued` (creator only, existing policy). ~~A `claimed` campaign cannot be cancelled from the browser — the phone is mid-run and owns it; the phone's own UI stops it.~~ **Superseded 2026-09-19 by §23.4:** a `claimed` campaign can be cancelled from the browser or the phone as a *request* (`cancel_requested_at`) that the phone honours before its next send; the creator, owners and admins may do it (this also supersedes "creator only"); unsent recipients end as `CANCELLED`, and sent messages stay sent.
 - The campaign list must say plainly, per §15.10, that a scheduled campaign runs **only while the creator's phone is online with CRMEX running**, and it shows when that phone was last seen so the claim is checkable rather than hopeful.
 
 **Device presence (decided 2026-09-19).** The phone is positioned as an always-on gateway, so "will it actually run?" has to be answerable before the scheduled time, not discovered afterwards:
@@ -1766,3 +1768,644 @@ Both end at `send_jobs`, and a client can be in both on the same day. They are n
 5. **Exclusions** (O-D2), then further occasion types.
 
 Test cases get IDs `OCC-*` in `test-plan.md` §22 once this section is approved.
+
+
+---
+
+## 20. Firm numbering — the number wheel
+
+Designed 2026-09-19. Not implemented. **Under review.** Prerequisite of §21, useful on its own.
+
+Matters and clients get their identifying numbers from the system, not from whoever is typing. Today `matters.matter_number` is free text a member types (unique per firm, `matters_org_id_matter_number_key`) and `clients` has no number at all. Free-text numbers collide, drift in format ("2026/14", "M-14", "14/2026"), and cannot be dictated by voice. The firm **owner** defines the format once (the "wheel"); the database hands out the next number.
+
+### 20.1 Decisions taken
+
+| # | Decision | Answer |
+| :--- | :--- | :--- |
+| **N1** | What is numbered | **Matters and clients.** ("client id" is read as a human-facing `client_number`; the UUID primary key is unchanged.) Tasks are not numbered (N-D1). |
+| **N2** | Who defines the format | **The firm owner only** (`org_members.role = 'owner'`), per firm. |
+| **N3** | Uniqueness | **Per firm.** Two firms may both have `M-2026-0001`; one firm never has two. |
+| **N5** | Related matters | **Sub-numbers** such as `M-2026-0042/01` (§20.10). Decided 2026-09-19. |
+| **N4** | Who assigns a number | **The database**, in a `BEFORE INSERT` trigger. Clients never send a number and cannot choose one, unless the owner turns manual entry on (N-D2). |
+
+### 20.2 Data model
+
+```text
+org_number_formats
+  org_id        uuid   references organizations(id) on delete cascade
+  kind          text   check (kind in ('matter', 'client'))
+  pattern       text   not null     -- e.g.  'M-{YYYY}-{SEQ:4}'
+  reset_period  text   not null default 'never' check (reset_period in ('never', 'yearly'))
+  next_seq      bigint not null default 1 check (next_seq >= 1)
+  period_key    text                -- the year the counter last ran in; null when reset_period = 'never'
+  allow_manual  boolean not null default false
+  updated_by    uuid, updated_at timestamptz
+  primary key (org_id, kind)
+
+clients.client_number  text          -- new; unique (org_id, client_number)
+clients.source         -- check gains 'voice' (§21.6)
+```
+
+**Pattern grammar.** Literal text plus tokens `{YYYY}`, `{YY}`, `{MM}`, `{SEQ}` and `{SEQ:n}` (zero-padded to width *n*, 1–10). Exactly one `{SEQ…}`; literal characters limited to `A–Z a–z 0–9 - _ / .`; at most 40 characters rendered. Anything else is rejected by a `check` and by the trigger, so a bad pattern can never reach the allocator.
+
+**Seeded defaults**, for every new firm (trigger on `organizations`) and by backfill for existing ones:
+
+| kind | pattern | reset | example |
+| :--- | :--- | :--- | :--- |
+| `matter` | `M-{YYYY}-{SEQ:4}` | yearly | `M-2026-0001` |
+| `client` | `C-{SEQ:5}` | never | `C-00001` |
+
+### 20.3 Allocation
+
+A `security definer` trigger function (`set search_path = ''`, `revoke execute` from everyone — only the trigger calls it) runs `BEFORE INSERT` on `matters` and `clients` when the number is null:
+
+```sql
+update org_number_formats
+   set next_seq   = case when period_key is not distinct from :cur then next_seq + 1 else 1 end,
+       period_key = :cur
+ where org_id = new.org_id and kind = :kind
+returning ... ;   -- render pattern, check the firm does not already hold that number, else advance and retry (max 100)
+```
+
+- **The row lock is the serializer.** The `UPDATE` locks the firm's counter row until the inserting transaction ends, so concurrent inserts in one firm queue up rather than race. Different firms never contend.
+- **Gapless on failure.** The counter moves inside the same transaction as the insert. A failed or rolled-back insert returns its number. A non-member inserting with another firm's `org_id` allocates, is then rejected by RLS, and rolls the counter back with it.
+- **Collisions are skipped, not fatal.** If the next rendered number is already taken (a legacy hand-typed number, an import, or the owner lowered `next_seq`), the allocator advances and retries. The unique constraint remains the final guarantee.
+- **`{YYYY}` is the UTC year** until firms have a timezone (§16.4.1); then it becomes the firm's year (N-D3).
+
+### 20.4 Immutability and manual entry
+
+With `allow_manual = false` (the default):
+
+- an `INSERT` carrying a non-null number is rejected — for `service_role` too, because the trigger, not RLS, enforces it (same division as `send_jobs_guard()`);
+- an `UPDATE` that changes a number is rejected. File numbers are quoted in letters and court papers; they are never re-issued.
+
+With `allow_manual = true`, a member may type a number (validated unique per firm) or leave it blank to auto-assign. Existing rows keep whatever number they have; **changing a pattern or resetting the counter affects only future numbers and never rewrites existing ones.**
+
+### 20.5 Access (RLS)
+
+- `org_number_formats`: members **select**; **owner** insert/update; no delete; no other firm's rows visible (`is_org_member` / `has_org_role(org, '{owner}')`).
+- `next_seq` may be raised or lowered by the owner. The UI warns that lowering it only causes collisions to be skipped, never duplicates.
+- Members create matters and clients as they do today; they cannot read or touch the counter directly.
+
+### 20.6 UI
+
+**Settings → Firm → Numbering** (owner; read-only for others). One card per kind: pattern field with the token chips, reset period, "next number" field, `Allow manual numbers` switch, and a **live preview** of the next three numbers ("M-2026-0042, M-2026-0043, M-2026-0044") rendered by the same function the database uses (shared renderer, tested for equality with the trigger — NUM-13). Save confirms: "Affects new matters only. Existing numbers are unchanged."
+
+The New matter / New client forms lose their number field (shown read-only after save; "will be assigned" before). Matters and clients lists search by number.
+
+### 20.7 Migration
+
+1. `org_number_formats` + RLS + seed trigger + backfill for existing firms (`next_seq = 1`; the collision skip handles legacy numbers).
+2. `clients.client_number`, unique per firm; **backfilled in `created_at` order** so numbering reads chronologically.
+3. Triggers on `matters` and `clients`; `matters.matter_number` keeps its `not null` and unique constraint (the `BEFORE` trigger fills it before the not-null check runs).
+
+### 20.8 Open decisions
+
+| # | Decision | Options | Recommendation |
+| :--- | :--- | :--- | :--- |
+| **N-D1** | Number tasks too | no / yes | **Decided 2026-09-19: matters and clients only.** Tasks are working items, not files. |
+| **N-D2** | Manual override | never / owner switch | **Decided 2026-09-19: owner switch, default off** — some firms have legacy numbering they must continue. |
+| **N-D3** | Yearly reset boundary | UTC / firm timezone | **Decided 2026-09-19: UTC now, the firm's timezone once §16.4.1 lands.** |
+| **N-D4** | Backfill client numbers | yes / leave null | **Decided 2026-09-19: backfill** in `created_at` order. |
+| **N-D5** | Sub-numbering (e.g. `M-2026-0042/01`) | no / later / now | **Decided 2026-09-19: design now** — see §20.10. |
+
+### 20.9 Build order (proposed, after approval)
+
+1. Migration (§20.7) and the allocator, with `NUM-*` offline + `test:live` cases.
+2. Shared renderer + Settings → Firm → Numbering screen (owner).
+3. Remove the number fields from the matter/client forms; show and search by number.
+
+Test cases: `test-plan.md` §23.
+
+### 20.10 Sub-numbering — related matters
+
+Decided 2026-09-19 (N-D5). A matter can have **related matters** numbered under it: `M-2026-0042` → `M-2026-0042/01`, `/02`, …
+
+```text
+matters.parent_matter_id  uuid null      -- composite FK (parent_matter_id, org_id) -> matters (id, org_id) on delete restrict
+matters.next_child_seq    int  not null default 1
+org_number_formats.sub_pattern  text     -- on the 'matter' row; default '{PARENT}/{SEQ:2}'
+```
+
+- **One level only.** A root has no parent; a child cannot itself have children (a trigger rejects a parent that is already a child). Multi-level trees are out of scope.
+- **Number.** `{PARENT}` is the parent's number *at creation*; `{SEQ:n}` comes from the parent's own `next_child_seq`. The pattern needs exactly one `{PARENT}` and one `{SEQ…}` and uses the same character set as §20.2. The owner edits `sub_pattern` in Settings → Firm → Numbering; changing it never rewrites existing children.
+- **Allocation.** The same `BEFORE INSERT` trigger as §20.3, with a second branch: `update matters set next_child_seq = next_child_seq + 1 where id = new.parent_matter_id and org_id = new.org_id returning …`. The row lock on the **parent** serializes its children; siblings of different parents never contend; the root counter in `org_number_formats` is untouched. Gapless on rollback, and the same collision-skip rule applies.
+- **Immutable.** `parent_matter_id` and the assigned number never change after insert — re-parenting is rejected, for `service_role` too (§20.4).
+- **Firm boundary.** The composite foreign key means a parent from another firm cannot be referenced.
+- **Deletion.** A matter that has children cannot be deleted (`on delete restrict`); the error names the children.
+- **UI.** Matter detail shows **Related matters** and a **New related matter** button that prefills the parent; the number preview reads "will be M-2026-0042/03". The list groups children under their parent, and search by number matches either.
+- **Assistant and voice.** `create_matter` accepts an optional `parent_matter` **reference**, resolved by the executor (an ambiguous parent drops the action to Ask, §22.4). The model never supplies a number.
+- **Migration.** Adds the columns, the trigger branch and the `sub_pattern` default; existing matters are all roots.
+
+---
+
+## 21. Voice matter capture (Android and browser)
+
+Designed 2026-09-19. Not implemented. **Under review.** Needs §20.
+
+> **Amended 2026-09-19 by §22.** Smart mode is replaced by the AI assistant: a voice transcript is simply a prompt to `POST /assistant/runs`. §21.5 (`/matters/voice-draft`), V2's "Smart", V-D6 and V-D8 are superseded; invariant 1 becomes "voice creates only what the autonomy matrix allows, default Ask"; invariant 4 is superseded by §22.5 (the model sees what its read tools return, within the owner's toggles). **Guided mode, §21.3 recognition, §21.6 matching and the §21.7 review screen remain**, the matcher now running in the executor. `create_matter_bundle` is subsumed by the executor's RPCs.
+
+The user speaks; the app produces a **reviewed draft** of a matter — with the clients it concerns and any dates mentioned — and creates it only when the user confirms. Two modes, the user's choice: **Smart** (one description, an AI extracts fields and asks only for what is missing) and **Guided** (the app asks one question at a time, no AI).
+
+### 21.1 Decisions taken
+
+| # | Decision | Answer |
+| :--- | :--- | :--- |
+| **V1** | Speech-to-text | **On the phone: Android `SpeechRecognizer`.** No CRMEX-side audio upload or transcription provider. See §21.3 for what "on the phone" does and does not guarantee. |
+| **V2** | Interaction | **Both, user picks** (§21.4). Smart is the default; Guided is the fallback and always available. |
+| **V3** | Languages | **English, Malay, Chinese (Mandarin).** One language per recording, chosen by the user. |
+| **V4** | What voice may fill | The matter; **link existing clients by name**; **propose a new client** when none matches; **add follow-up tasks / deadlines / hearing dates.** |
+| **V5** | Numbers | **Never spoken, never extracted.** Matter and client numbers are assigned by the database (§20). |
+| **V6** | Platform | **Android and Chromium browsers** (decided 2026-09-19, V-D5). Android uses the speech plugin; the browser uses the Web Speech API. Both feed the same assistant and Guided screens through a `speech` capability on `PlatformServices`. |
+
+### 21.2 Invariants
+
+1. **Voice never writes.** Speech only produces a draft. The **review screen is the only write path**, and nothing is saved before the user taps Create.
+2. **Audio is never stored or uploaded by CRMEX.** The transcript lives in memory for the session and is discarded on save, on Discard, and when the app is killed. It is not written to `outbox`, SQLite, Supabase or any log.
+3. **The extraction endpoint is read-only and stateless.** It calls the LLM and returns JSON. It writes nothing but the per-firm quota counter.
+4. **The firm's client list never goes to the LLM.** Clients are matched on the device (§21.5). The model sees only what the user said.
+5. **Model output is untrusted input.** It is schema-validated like any request body; it can never carry a number, an id, or SQL, and a transcript cannot cause any action other than proposing a draft.
+6. **The firm is verified server-side.** `X-Org-Id` is checked against `org_members`, as on every firm-scoped route (§15.4).
+
+### 21.3 Recognition — and what "on-device" really means
+
+The Android recognizer is a **system service**, not CRMEX code. On the test phone (Huawei P30 Pro, Android 10) it is Google's (`com.google.android.googlequicksearchbox` → `GoogleRecognitionService`, checked 2026-09-19). Two consequences that must be stated plainly:
+
+- **By default the Google recognizer may stream audio to Google's servers.** It stays on the phone only when an offline language pack is installed *and* the request sets `EXTRA_PREFER_OFFLINE`. CRMEX sets that flag, but cannot force it and cannot tell the user which path was taken.
+- **Android 13+ (API 33) adds `createOnDeviceSpeechRecognizer()`, which guarantees local recognition. The test phone is API 29 and cannot use it.** So on that phone privacy is best-effort.
+
+Because the content is privileged, the owner gets a firm switch (§21.7): **"Require on-device recognition."** When on, voice is offered only on devices that can guarantee it (API 33+ with the language pack installed) and is hidden elsewhere with an explanation. Off by default (V-D1).
+
+| Locale | Tag | Note |
+| :--- | :--- | :--- |
+| English | the device's English locale (`en-*`) | |
+| Malay | `ms-MY` | |
+| Chinese | `zh-CN` (Mandarin) | Cantonese is a separate locale (`zh-HK`/`yue`) — V-D4 |
+
+- **One language per recording.** Switching mid-sentence is not supported; an English case name inside Malay or Chinese speech is often mis-transcribed, so the user corrects it on the review screen. The LLM in Smart mode accepts a transcript in any of the three.
+- **Permissions and platform:** runtime `RECORD_AUDIO` (a new manifest permission) and a `<queries>` entry for `android.speech.RecognitionService` (package visibility on Android 11+; the app targets 36). Denied or unavailable → the mic is disabled with the reason and the form stays fully usable by typing.
+- **Plugin (V-D2):** `@capacitor-community/speech-recognition` 7.0.1 declares `@capacitor/core >=7`; this app is on Capacitor 8.5.2, so it must be proven in a spike. If it is not compatible, **stop and ask**: V-D2 was decided as community plugin only, so a custom Java plugin would be a new decision.
+- **Testing:** the emulator has **no Google recognition service**, so speech can only be tested on the physical phone.
+- **Browser (V-D5):** the Web Speech API (`SpeechRecognition`, Chromium-based browsers over HTTPS or localhost). **Audio is always sent to Google's servers and there is no on-device option**, so when the owner's `voice_require_on_device` is on, browser voice is hidden with an explanation. The mic is hidden where the API is missing (Firefox, Safari); a denied mic permission falls back to typing. Same three languages via the `lang` setting; same one-language-per-recording rule.
+
+### 21.4 The two modes
+
+Entry point: Matters → **New matter** → a **Voice** button beside the form; a per-user preference remembers the last mode. Smart falls back to Guided automatically, with a one-tap prompt, when the device is offline, the firm's daily voice quota is spent, or extraction fails twice.
+
+#### Smart
+
+1. Prompt: *"Describe the matter — who it's for, what it's about, and any dates."* Language chips (EN · BM · 中文) sit above the mic.
+2. The transcript streams onto the screen and stays **editable**. When recognition stops (the recognizer ends on silence), the user can continue or send.
+3. `POST /api/v1/matters/voice-draft` returns the updated draft, a list of what is still `missing`, and one follow-up `question` in the user's language.
+4. The question is shown as text (spoken aloud only if the user turned on the speaker, V-D3) and the mic reopens. **At most 4 follow-up turns**, then the app goes to review with the gaps left blank. **Skip to review** is always available.
+
+#### Guided
+
+Fixed order, one card per question, **no server call** — so it works offline and when quota is exhausted:
+
+| Step | Voice does | Input |
+| :--- | :--- | :--- |
+| Who is the client? | dictate a name → local match → pick chips | may add several, with roles |
+| Matter title | dictated verbatim into the field | text |
+| Practice area | — | chips (the firm's existing values + Other) |
+| Any hearing or deadline? | — | **date picker** |
+| Notes | dictated verbatim | text |
+
+**Guided does not parse spoken dates or categories.** Understanding "third of March" or "bulan depan" or "下周二" in three languages needs the model; Guided deliberately does not, and uses pickers instead.
+
+### 21.5 Server: `POST /api/v1/matters/voice-draft`
+
+Firm-scoped (`requireOrgMember`), next to `/messages/draft`, mounted with the same quota pattern (`orgUsageRepo`, limits read from `app_settings`, e.g. `voice.drafts_per_day`).
+
+```text
+request   { transcript, language: 'en'|'ms'|'zh', today: 'YYYY-MM-DD', timezone?,
+            draft?: <previous draft>, turn: 1..5 }
+limits    transcript <= 4000 chars; turn <= 5; body size capped
+response  { draft: {
+              title: string|null, practice_area: string|null,
+              status: 'open'|'pending'|null, opened_on: 'YYYY-MM-DD'|null, notes: string|null,
+              clients: [{ spoken_name, role: 'client'|'opposing_party'|'witness'|'other' }],
+              tasks:   [{ title, kind: 'task'|'deadline'|'hearing', due_on: 'YYYY-MM-DD'|null }] },
+            missing: ('title'|'clients'|'practice_area')[],
+            question: string|null }
+```
+
+- **Validated with zod on the way out**, the same as the drafter's input. Unknown keys are dropped; a number, id or non-ISO date is rejected; `tasks` is capped (e.g. 10) so a transcript cannot spawn dozens.
+- **Relative dates** ("next Tuesday") are resolved against the `today` the client sends; an ambiguous date returns `null` and becomes the follow-up question rather than a guess.
+- **Prompt injection:** the transcript is data. The route has no tools and no side effects, so the worst outcome of a hostile transcript is a schema-valid but wrong draft — which the review screen exists to catch.
+- **No bodies in logs.** The route does not log the request, and provider errors are mapped to a generic code exactly as `/messages/draft` does today.
+- Errors follow the existing codes (`LLM_ERROR`, `PROVIDER_TIMEOUT`, quota) so the app can offer Guided.
+
+### 21.6 Resolving clients (on the device)
+
+For each `clients[].spoken_name` the app compares against the firm's clients, in `shared-ui`:
+
+- Normalize case, diacritics and whitespace; strip Malay honorifics (*Encik, Puan, Dato', Datuk, Tan Sri, bin/binti* handled as name particles); match Chinese names by exact and substring.
+- **Strong match → preselected. Several close → a pick list. None → a "Create new client" draft** (display name only, `source = 'voice'`, kind chosen from the role — e.g. `opposing_counsel`). The app **never auto-picks an ambiguous match and never auto-creates**; every mention needs an explicit choice on the review screen.
+- A client created this way gets its `client_number` from §20 like any other, and is subject to §12 exactly like a manual one (no phone → cannot be messaged anyway).
+
+### 21.7 Review, create, and firm settings
+
+**Review screen** (the write gate, invariant 1):
+
+- *Matter* — the number is shown as "will be assigned: M-2026-0042" (read-only, §20.6), then title, practice area, status, opened date, notes.
+- *Clients* — each mention shows its matched client with alternatives, or the new-client draft, or **Skip**, plus a role.
+- *Tasks* — each proposed task with kind and date, each individually switchable.
+- *Transcript* — collapsible, editable, with **Re-run**.
+- Fields the model left `null`, and matches that were not strong, are visually marked. Actions: **Create**, **Back to talk**, **Discard** (wipes the transcript).
+
+**Create** calls one Postgres function, `create_matter_bundle(p jsonb)`, `security invoker` (so RLS applies per table exactly as if the user had made each insert by hand), in a **single transaction**: new clients → matter → `matter_clients` → tasks. It is **all-or-nothing** and returns the created ids and the assigned numbers. The client supplies the matter's UUID up front as an idempotency key: repeating the call after a dropped connection or double tap returns the existing matter and never creates a second. The composite foreign keys (`matter_clients`, `tasks`) already reject a client or matter from another firm.
+
+**Firm settings** (owner, new `org_settings` table, defaults in brackets): `voice_smart_enabled` [true] — off means Guided only and the endpoint refuses that firm, for firms that will not send transcripts to an LLM provider; `voice_require_on_device` [false] — §21.3.
+
+### 21.8 Privacy summary
+
+| Data | Where it goes |
+| :--- | :--- |
+| Audio | The Android recognizer service only. Possibly Google's servers unless offline recognition applies (§21.3). Never CRMEX. |
+| Transcript, Guided mode | Stays on the phone until the user saves what they chose to save. |
+| Transcript, Smart mode | Sent to `core-server` and on to the LLM provider under the existing provider terms. Not stored, not logged. Owner can disable Smart. |
+| Client list | Never leaves the phone for matching; the LLM does not receive it. |
+
+### 21.9 Open decisions
+
+| # | Decision | Options | Recommendation |
+| :--- | :--- | :--- | :--- |
+| **V-D1** | Recognizer privacy | accept best-effort `PREFER_OFFLINE` / require guaranteed on-device (API 33+ only) | **Decided 2026-09-19: best-effort by default with the owner's "require on-device" switch.** Requiring it everywhere would disable voice on the current test phone. |
+| **V-D2** | Plugin | community plugin / custom Java plugin | **Decided 2026-09-19: community plugin only.** Spike it first; if it does not work on Capacitor 8, stop and ask — no custom plugin without a new decision. |
+| **V-D3** | Read follow-up questions aloud | text only / spoken | **Decided 2026-09-19: text, with a speaker toggle default off** — reading privileged questions aloud in public is a leak. `@capacitor-community/text-to-speech` 8.0.2 targets Capacitor 8; Google TTS is present on the test phone. |
+| **V-D4** | Cantonese | Mandarin only / also `zh-HK` | **Decided 2026-09-19: Mandarin only** unless a firm needs it. |
+| **V-D5** | Browser voice | none / Web Speech API | **Decided 2026-09-19: yes, via the Web Speech API in Chromium browsers.** Audio always goes to Google there; the owner's on-device-only switch hides it (§21.3). |
+| **V-D6** | Who writes the follow-up question | the LLM in the user's language / canned per-field questions | **Superseded 2026-09-19 by §22:** the assistant's model writes it; Guided stays deterministic. |
+| **V-D7** | Provenance of voice-made clients | `source = 'voice'` / `'manual'` | **Decided 2026-09-19: `'voice'` for any client created through voice or the assistant**, one added check value. The name is broader than "spoken", by choice. |
+| **V-D8** | Quota | share `draft` quota / own `voice.drafts_per_day` | **Superseded 2026-09-19 by §22:** voice uses the assistant quota (`agent_turns`, per firm with a per-user share). |
+
+### 21.10 Build order (proposed, after approval)
+
+1. **Speech spike** on the P30 Pro: plugin compatibility with Capacitor 8, `RECORD_AUDIO` + `<queries>`, English/Malay/Mandarin transcripts, `PREFER_OFFLINE` behaviour with airplane mode on. Gate for the rest.
+2. **§20 numbering** (the review screen shows the assigned number).
+3. **`create_matter_bundle`** RPC + `clients.source` value + `org_settings`.
+4. **Guided mode** in `shared-ui` (no server), client matcher, review screen.
+5. **`POST /matters/voice-draft`** + quota + schema, then **Smart mode**.
+6. Owner settings screen.
+
+Test cases: `test-plan.md` §24.
+
+
+---
+
+## 22. AI assistant — server-side agent on gyrfalcon
+
+Designed 2026-09-19. Not implemented. **Under review.** Builds on §17 (gyrfalcon integration) and **amends** it (§22.13). Replaces §21's Smart mode: voice becomes the microphone on the assistant.
+
+Wherever the product needs AI beyond a single short call, the phone sends a **prompt** to `core-server`; `core-server` runs the request through **gyrfalcon** and turns the agent's answer into **real records** — clients, matters, tasks, hearings, message drafts, send jobs — according to a per-action policy the firm owner sets. The phone then shows what was created. **There is no separate "mini harness":** gyrfalcon is the only agent engine, and `core-server` is the API, the policy layer and the only writer.
+
+### 22.1 Decisions taken
+
+| # | Decision | Answer |
+| :--- | :--- | :--- |
+| **A1** | Agent engine | **Gyrfalcon only.** `core-server` forwards; no second agent loop. Everything goes through the §17.3 `AgentEngine` adapter, with a `fake` for offline tests. |
+| **A2** | Who writes | **`core-server`, never gyrfalcon.** Gyrfalcon returns a structured **plan**; `core-server` validates it and executes or stages each action (§22.4). |
+| **A3** | Reads | **Read tools call back into `core-server`** (§22.5). Writes never do. |
+| **A4** | Commit policy | **Per-action autonomy, Ask or Auto, set by the owner.** Every action type can be Auto, including outbound sends, bounded by the outbound cap (A5). Default for everything except drafts is **Ask**. |
+| **A5** | Outbound cap | **50 messages per firm per day by default.** The owner may lower it; the operator sets the ceiling. Counts recipients, not jobs. Past the cap an Auto action falls back to Ask. |
+| **A6** | Uncertainty | **Never guess.** An ambiguous match, a near-duplicate, or an unclear date makes *that action* drop to Ask; the rest of the plan proceeds. |
+| **A7** | Deletes | **None, ever.** The catalog has no delete. Cancelling a queued job is an update. |
+| **A8** | Reversibility | Every write is logged with before/after and has a one-tap **Undo for 24 h** (§22.6). Sent WhatsApp messages cannot be unsent; the log says so. |
+| **A9** | Models | **The operator's allow-list lives in `app_settings` (`agent.models_allowed`); the owner picks one per firm** (amended 2026-09-19 from an env list). `core-server` sends the chosen model with each run; **provider keys stay in one server env and are never sent to a client or shown in any UI** (§22.9). |
+| **A10** | System prompt | **Controlled by the SaaS operator** (e.g. law-firm topics only). Layered above firm and member instructions; lower layers may narrow, never widen (§22.7). Off-topic gets a fixed refusal. |
+| **A11** | Memory | **Per-user rolling session per firm, kept *N* days**; the owner sets *N* (default 30). Nothing is shared between members. |
+| **A12** | Kill switch | **Two, either one stops all AI:** the firm owner (their firm) and the SaaS admin (everyone). The app is told which one, and says so (§22.8). |
+| **A13** | Live delivery | **SSE for the assistant's text; Supabase Realtime for the rows** (drafts, records, run status). |
+| **A14** | Read scope | Clients (names, kind, tags, notes), matters and tasks (incl. notes), message-history bodies, images and files. **Each class has an owner toggle** (§22.6). |
+| **A15** | Entry points | Floating assistant button on every main screen; the assistant sheet inside Messages Compose; contextual on matter and client detail; **"New by voice"** on the Clients, Matters and Tasks lists. |
+| **A16** | Background jobs | Agent runs may be long-running. Results land in an **in-app inbox with a badge only** — no push and no local notification for agent runs (decided 2026-09-19, §22.10). |
+| **A17** | Voice | **Merged.** A voice transcript is just a prompt. The dedicated voice-draft endpoint is dropped; §21 Guided mode stays as the no-AI fallback. |
+
+### 22.2 Architecture
+
+```text
+phone/browser ──HTTPS + Supabase JWT + X-Org-Id──▶ core-server ──(private)──▶ gyrfalcon
+   ▲   SSE (text) ◀────────────────────────────────┤  │  ▲                        │
+   │   Realtime (rows) ◀── Supabase ◀───────────────┘  │  └── read-tool callbacks ─┘
+   │                                                    ▼        (run-scoped token)
+   └─────────────────────────────────────────────── Supabase (authoritative)
+```
+
+Per request, `core-server`:
+
+1. verifies the JWT and `X-Org-Id` against `org_members` (§15.4);
+2. evaluates the **kill switches** and **quota** (§22.8) — before any gyrfalcon call;
+3. builds the **layered prompt** (§22.7), picks the **model** (§22.9), mints a **run-scoped token**;
+4. inserts `agent_runs` and calls `startChatTurn`;
+5. relays text over SSE, lets gyrfalcon call the read tools, receives the **plan**;
+6. validates the plan and runs the **executor** (§22.4);
+7. writes `agent_actions` / `agent_proposals`, which the phone receives over Realtime.
+
+### 22.3 The assistant, from the phone
+
+- **Prompt in, records out.** The app sends `{message, sessionId?, context, language}` where `context` says where the user is (`screen`, and the active `matterId` / `clientId` / `draftId` if any). The context carries **ids only**; `core-server` loads whatever the agent needs.
+- **What appears.** Assistant text streams into the sheet. Each executed or staged action shows as a **result card** — *"Created client Fatma Ali · C-00214 · Open"*, *"Matter M-2026-0042 ready — Confirm"* — with Undo (Auto) or Confirm / Reject (Ask). The app navigates to the created record when the user taps it; lists refresh through the existing `bump()` mechanism and Realtime, so **the phone pulls out what the server just created** rather than being handed it.
+- **Voice** is the mic beside the text box (§21.3 recognition unchanged). A recording becomes the prompt.
+- **Guided voice** (§21.4) is untouched: no AI, no server call.
+
+### 22.4 Plan and executor
+
+Gyrfalcon's structured result:
+
+```text
+{ summary: string,
+  actions: [ { id, type, args, depends_on: [id], rationale } ],
+  questions: [ string ]            // shown when the plan needs an answer to continue
+}
+```
+
+**Action catalog and defaults.** The set is closed: gyrfalcon cannot invent an action, and there is no delete (A7).
+
+| Action `type` | What it does | Outbound? | Default |
+| :--- | :--- | :--- | :--- |
+| `draft_message` | create or update a `message_drafts` row (§23.1) | no — never sends | **Auto** |
+| `create_client` / `update_client` | clients | no | Ask |
+| `create_matter` / `update_matter` | matters (number auto-assigned, §20) | no | Ask |
+| `link_client_to_matter` | `matter_clients` with a role | no | Ask |
+| `create_task` / `update_task` / `complete_task` | tasks, deadlines, hearings | no | Ask |
+| `queue_send` | insert a `send_jobs` row now | **yes** | Ask |
+| `schedule_campaign` | `send_jobs` with schedule and pace (§18) | **yes** | Ask |
+| `cancel_send_job` | cancel a batch (§23.4) | no | Ask |
+| `start_background_run` | start a long-running agent run (§22.10) | no | Ask |
+
+**Executor** (`core-server/src/agent/executor/`, deterministic code, no LLM):
+
+1. **Validate** every action with a per-type `zod` schema. Ids are never taken from the model: references to existing records are resolved by the executor (e.g. a spoken client name → the §21.6 matcher), and the result is re-checked against the firm.
+2. **Resolve ambiguity** per A6. Two similar clients, a name that nearly matches an existing client, or an ambiguous date sets that action to `ask` regardless of the matrix.
+3. **Apply the matrix.** `auto` → execute now; `ask` → insert `agent_proposals(status='pending')` and notify.
+4. **Enforce the outbound cap** on `queue_send` / `schedule_campaign`: recipients counted against the firm's day; over the cap → `ask` with the reason shown. Opt-out, client `status`, phone presence and `limits.max_batch_recipients` apply exactly as in §12 / §18.7 — the executor does not bypass any of them.
+5. **Execute** in `depends_on` order through **`security invoker` RPCs** (the same approach as §16's `apply_move`), so RLS still bounds what a member could have done by hand. Each action gets an idempotency key `hash(run_id, action.id)`; a retry cannot duplicate.
+6. **Log** one `agent_actions` row per action (§22.6). A failed action is reported, not silently retried; actions that already succeeded are not rolled back automatically — the user sees the partial result and can Undo any of them.
+
+Accepting a staged proposal (`POST /assistant/proposals/:id/accept`) runs the *same* executor path as the user, with the same validation — the server, not the phone, commits it.
+
+**Authority for background runs** (AG-D1): a run that outlives the user's JWT executes with the service role, **re-verifying membership and the action's policy at execution time, stamping `created_by = run.user_id`, and filtering every query by `org_id`** — the rule already applied to the retention job and the §16 dispatcher.
+
+### 22.5 Read tools
+
+`/internal/agent-tools/read/*`, called by gyrfalcon with the **run-scoped token** (bound to `(org_id, user_id, run_id)`, ~15 min, revoked at run end, never accepted for a write). `core-server` resolves the firm from the token, never from arguments.
+
+`search_clients`, `get_client`, `list_matters`, `get_matter`, `list_tasks`, `search_messages`, `get_image` (metadata only; signed URLs never leave `core-server`).
+
+- Every result is **capped** (rows and characters) and filtered by `org_id`.
+- **Phone numbers and emails are excluded** unless the owner allows them.
+- The owner's **read-scope toggles** (§22.6) remove whole classes. Notes and message bodies contain privileged content and go to the LLM provider under its terms; the toggles exist so a firm can keep them out.
+- **Retrieved text is untrusted.** Notes, messages and client names are wrapped as data, and a plan is validated the same way whatever the source of the instruction (§22.11).
+
+> This **supersedes §21 invariant 4** ("the firm's client list never goes to the LLM"). What the model can see is now what its read tools return, within the owner's toggles.
+
+### 22.6 Data model and the Agent setup
+
+```text
+org_agent_settings       -- one row per firm; members select, OWNER inserts/updates
+  org_id, enabled boolean, model text,
+  autonomy jsonb,          -- { create_client: 'ask'|'auto', ... } — missing key = default
+  outbound_cap int,        -- <= operator ceiling
+  read_scope jsonb,        -- { clients, matters_tasks, message_bodies, images, contact_details }
+  enabled_tools text[], instructions text (<= 2000 chars),
+  limits jsonb,            -- { turns_per_day, max_steps_per_run, max_tokens_per_run }
+  memory_days int default 30, transcript_days int default 30,
+  updated_by, updated_at
+
+user_agent_prefs         -- per (user, org); the user reads/writes only their own row
+  user_id, org_id, reply_language, verbosity, speak_replies boolean, notify boolean
+
+agent_runs               -- §17.3: firm-scoped; members read; core-server writes
+  + user_id, kind ('chat'|'background'), session_ref, status, model, error, timestamps
+
+agent_proposals          -- §17.3: staged Ask actions; members read; core-server writes
+agent_actions            -- new: one row per executed/staged action
+  id, org_id, run_id, type, target_table, target_id, auto boolean,
+  before jsonb, after jsonb,               -- what changed, for Undo
+  status ('applied'|'undone'|'failed'), undo_expires_at, decided_by, decided_at
+
+message_drafts, message_draft_versions   -- §23.1
+```
+
+RLS: everything firm-scoped; `org_agent_settings` writable only where `has_org_role(org, '{owner}')`; the operator has **no** read of any of it (§13.2 / §15.8). `agent_actions` contains client data in `before`/`after`, so it follows the same firm boundary as the records themselves.
+
+**Undo** (`POST /assistant/actions/:id/undo`, `security invoker` RPC): restores `before` for an `applied` update, and removes a create that has no dependents, **within 24 h** and only if the record has not been edited since (otherwise it explains and offers the manual path). It may be run by the run's user, or by an owner/admin. Undo of an outbound action is **not offered**: the card says "already queued — cancel the batch instead" / "sent messages cannot be unsent".
+
+**Agent setup menu** — *design only, not built.* Settings → **AI assistant**:
+
+```text
+┌─ AI assistant ───────────────────────────┐
+│ AI is ON                          [ON/OFF] │  owner. Read-only text if the operator turned AI off.
+│ Model            [ provider · model ▾ ]    │  choices come from the server's env allow-list
+├─ What it may do on its own ───────────────┤
+│ Create / update clients        [Ask ▾]     │  Ask | Auto, per action type
+│ Create / update matters        [Ask ▾]     │
+│ Tasks, deadlines, hearings     [Ask ▾]     │
+│ Draft messages                 [Auto ▾]    │
+│ Send or schedule messages      [Ask ▾]     │  outbound
+│   Daily outbound cap           [ 50 ]  (max 100 set by the platform)
+├─ What it may read ────────────────────────┤
+│ Clients · Matters/Tasks · Message text · Images · Phone numbers/emails
+├─ Tools ───────────────────────────────────┤
+│ each capability switchable
+├─ Firm instructions ───────────────────────┤
+│ free text, 2000 chars — narrows behaviour, cannot override the platform policy
+├─ Limits, memory, retention ───────────────┤
+│ Turns / day · Steps / run · Remember chats for [30] days · Keep transcripts [30] days
+└────────────────────────────────────────────┘
+Members see: language · verbosity · read replies aloud · notifications
+```
+
+### 22.7 The prompt, in layers
+
+1. **Operator system prompt** — key `agent.system_prompt` in `app_settings` (seeded default: law-firm practice management only; the assistant declines other topics). Set by the SaaS admin; **never editable or visible to a firm**; versioned. It never contains firm data.
+2. **Firm instructions** — owner text from `org_agent_settings.instructions`; may narrow, never widen; cannot enable a tool or raise a limit.
+3. **Member preferences** — reply language, verbosity.
+4. **Run context** — the ids and the pushed data for this screen.
+
+**Off-topic:** the operator prompt tells the model to answer an out-of-scope request with a fixed marker; `core-server` replaces it with a **fixed, localized refusal string** and produces no plan. The refusal wording is not model-improvised. (A pre-check classifier was considered and rejected: it adds a component that can misclassify legitimate legal work.)
+
+### 22.8 Kill switches, quotas, and telling the user
+
+**Effective state = operator switch AND firm switch AND (not over quota).** Either switch off means no gyrfalcon call, no run, no tool token.
+
+- Operator: `app_settings` key `agent.enabled`. Firm: `org_agent_settings.enabled`. **New firms start ON** (decided 2026-09-19); the owner can turn AI off at any time. Because privileged content goes to an LLM provider, the first use by each member shows a one-time notice of what is sent (and that the owner can turn it off) — informational, not a gate (AG-D3).
+- `GET /api/v1/assistant/status` → `{ enabled, disabledBy: 'operator'|'owner'|null, reason?, quotaRemaining }`. Any assistant call while disabled returns a stable code `AI_DISABLED` with the same `disabledBy`.
+- **The app must say so**, not fail silently: the assistant button stays visible but shows *"AI is turned off by your firm owner"* or *"AI is temporarily unavailable"*. Manual entry, Guided voice and the composer keep working.
+- **Flipping a switch stops in-flight work:** the run-scoped tokens are revoked and running runs are cancelled; staged Ask proposals remain (a human can still accept or reject them) unless the owner rejects them.
+- Quotas (`org_usage_daily`, §13.5): `agent_turns`, `agent_tokens`, `outbound_auto`, checked before any gyrfalcon call; limits are the owner's, capped by operator ceilings (`agent.*_ceiling` in `app_settings`).
+
+### 22.9 Models and keys
+
+- **`app_settings`** holds the allow-list (`agent.models_allowed`, `provider:model` entries) and `agent.default_model`; **the provider keys stay in the one shared server env** (`ANTHROPIC_API_KEY`, …). A listed model whose provider key is missing is rejected when the operator saves the list and skipped at run time, so a firm can never be set to a model the server cannot call.
+- The owner picks from the list in Agent setup; nothing else can be entered. `core-server` passes the chosen **model and generation settings with each run**; it does not send keys to the client, and does not put them in prompts or logs.
+- This needs **a per-run model override in gyrfalcon** (G7, §22.13) — §17.1 does not say it exists. Until then, a fixed model configured in gyrfalcon is the fallback, and the firm's choice is stored but has no effect.
+
+### 22.10 Background runs and the inbox
+
+A `background` run is started by the user ("do this in the background"), by an Ask→accept, or later by the §16 dispatcher. It has a hard **step and time limit** from the owner's settings (bounded by operator ceilings).
+
+- **Progress and result** land in `agent_runs` / `agent_actions` (Realtime) and a **`notifications` inbox row** (§16.4.3) with a badge. Inbox text is **minimal** — no client names (§16.6.2).
+- **Inbox only (AG-D5, decided 2026-09-19).** There is **no push and no local notification** for agent runs: results are seen when the app is opened, and the UI says so. (FCM for campaigns, §18.9, is a separate deferred item and is unaffected.)
+
+### 22.11 Security
+
+- **Auto is the blast-radius decision, so the guards are structural:** the closed action catalog; no deletes; the outbound cap; A6 (uncertainty → Ask); idempotency keys; all writes through RLS-bounded RPCs; the existing opt-out, `status`, phone and batch-size checks re-applied by the executor.
+- **Prompt injection.** Client notes, message bodies and names read by the agent may contain instructions. They are passed as delimited data, and the executor treats the plan as untrusted regardless of source. The worst outcome is a wrong plan the matrix then stages (Ask) or — for an action the owner set to Auto — applies and logs with Undo. The outbound cap bounds the outbound case.
+- **Gyrfalcon holds no credentials into CRMEX data** except the short-lived run-scoped token, valid for read tools only.
+- **Tenancy inside gyrfalcon** follows §17.4 (option C in dev, option A before any real firm data).
+- **No bodies in logs**; provider errors map to generic codes as `/messages/draft` does.
+- **Operator boundary (§15.8):** the operator sees no `agent_runs`, no transcripts and no actions; only aggregate config. Gyrfalcon's dashboard stays unreachable to operators (G-D6).
+- **Retention:** transcripts deleted after `transcript_days` via gyrfalcon's delete APIs (G6); `agent_actions.before/after` follow the retention setting.
+
+### 22.12 Endpoints
+
+```text
+GET  /api/v1/assistant/status
+POST /api/v1/assistant/runs                 { message, sessionId?, context, language } -> { runId }
+GET  /api/v1/assistant/runs/:id/events      SSE: text deltas, tool names (never arguments), plan summary, action states
+GET  /api/v1/assistant/runs/:id
+POST /api/v1/assistant/runs/:id/cancel
+POST /api/v1/assistant/proposals/:id/accept | reject
+POST /api/v1/assistant/actions/:id/undo
+GET|PUT /api/v1/assistant/settings          owner writes; members read; validated against operator ceilings and the env allow-list
+GET|PUT /api/v1/assistant/prefs             the caller's own row
+/internal/agent-tools/read/*                run-scoped token only, never a user JWT
+```
+
+All under `requireOrgMember` except `/internal`. Firm-scoped refs (`runId`, `proposalId`, `actionId`) are loaded filtered by the verified `org_id` first, so a guessed id is a 404 before gyrfalcon or any write is reached (§17.3).
+
+### 22.13 Amendments to earlier sections
+
+- **§17.2 rule 3** ("agents never write") is **narrowed**: *gyrfalcon* never writes; `core-server`'s executor writes, per the owner's autonomy matrix, with Ask as the default.
+- **§17.10 G-D2**: stage 2 is now **read tools only**, and is **required**, not optional. **G4 (per-call credential injection) and G2 (tenant assertion) are therefore prerequisites** for any real firm data. Dev may use the single `LOCAL` principal.
+- **New gyrfalcon change G7:** per-run model/provider override, per-run system prompt, and structured-output (plan) enforcement. To be confirmed against gyrfalcon's code.
+- **§21:** Smart mode, §21.5 (`/matters/voice-draft`), V-D6 and V-D8 are **superseded**; §21 invariant 1 ("voice never writes") becomes "voice creates only what the autonomy matrix allows, default Ask"; invariant 4 is superseded by §22.5. Guided mode, §21.3 recognition and §21.6 matching remain (the matcher now runs in the executor).
+
+### 22.14 Open decisions
+
+| # | Decision | Options | Recommendation |
+| :--- | :--- | :--- | :--- |
+| **AG-D1** | Authority for runs that outlive the JWT | service role + re-verification / re-mint a user token | **Decided 2026-09-19: service role with re-verification**, stamped `created_by` (§22.4). |
+| **AG-D2** | Default matrix | all Ask except drafts / more Auto | **Decided 2026-09-19: all Ask except `draft_message`.** |
+| **AG-D3** | AI default for new firms | off until owner enables / on | **Decided 2026-09-19: on by default**, with the one-time notice of §22.8 and an owner off-switch. |
+| **AG-D4** | Operator ceilings, seeded | outbound / turns / steps / tokens | **Decided 2026-09-19: the tighter set — outbound **100/day**, turns **50/user/day**, steps **10/run**.** The owner's default outbound cap stays 50; adjustable later in the portal. |
+| **AG-D5** | Completion alert when the app is closed | inbox on next open / FCM | **Decided 2026-09-19: inbox only, never push** (§22.10). |
+| **AG-D6** | Session length | rolling until idle *N* days / per-conversation | **Decided 2026-09-19: rolling per (user, firm), idle-expiry = `memory_days`.** |
+| **AG-D7** | Quota unit | per user / per firm | **Decided 2026-09-19: per firm, with a per-user share** so one member cannot exhaust it. |
+| **AG-D8** | Undo window | 24 h / owner-set | **Decided 2026-09-19: 24 h, fixed.** |
+| **AG-D9** | Model allow-list format | env list / `app_settings` | **Decided 2026-09-19: `app_settings`** (this reverses the earlier env-list choice; keys stay in env, §22.9). |
+
+### 22.15 Build order (proposed, after approval)
+
+1. **Adapter + fake, migrations** (`org_agent_settings`, `user_agent_prefs`, `agent_runs`, `agent_proposals`, `agent_actions`), kill switches, `/assistant/status`, and the RLS + live tests.
+2. **Settings API and the Agent setup screens** — design here; built after the API.
+3. **Read tools** (needs gyrfalcon G4; dev on `LOCAL`) and the **plan executor** for the data-entry actions, with A6 and the action log.
+4. **Assistant sheet** on Android: SSE, result cards, Undo, entry points.
+5. **Voice into the assistant** (§21 Guided remains).
+6. **Outbound actions** and the outbound cap.
+7. **Background runs** and the inbox.
+8. Gyrfalcon **G2, G7, G1, G6**, then tenant assertion before real data.
+
+Test cases: `test-plan.md` §20.
+
+---
+
+## 23. Messaging composer, drafts, schedule step and batch cancel
+
+Designed 2026-09-19. Not implemented. **Under review.** Extends §18 (campaigns) and amends its cancel rule.
+
+### 23.1 Where a draft lives
+
+**The server creates and holds the draft; the phone renders it and patches it.** A `message_drafts` row is the source of truth, so a draft survives an app kill, opens on the browser, has an audit trail, and can be filled by the assistant.
+
+```text
+message_drafts     -- firm-scoped; the creator reads and writes; the firm OWNER may read (not edit) (MSG-D7)
+  id, org_id, created_by, status ('draft'|'submitted'|'discarded'),
+  body, media_path,
+  audience jsonb,             -- { filter | client_ids, query?, excluded: {...counts} }
+  schedule jsonb,             -- { scheduled_at?, interval_ms?, jitter_pct, expires_at? }  (§18.3.2)
+  version int, last_edit_by ('user'|'agent'), send_job_id?, timestamps,
+  edit_lock_device text, edit_lock_expires_at timestamptz   -- the edit lease (below)
+
+message_draft_versions   -- last ~20 versions per draft: (draft_id, version, body, audience, schedule, edit_by, at)
+```
+
+- **Not sent by drafting.** A draft is inert. Submitting it inserts a `send_jobs` row (§15.10 / §18); a draft never causes a send on its own.
+- **Populate, don't wait.** The screen renders the agent's edits as they stream and **patches the row optimistically**, debounced (~700 ms). Each patch carries the draft `version` as a safety check.
+- **One device edits at a time (MSG-D2, decided 2026-09-19).** Opening a draft takes an **edit lease** (`edit_lock_device`, `edit_lock_expires_at`): 2 minutes, renewed every 30 s while the screen is open. A second device opens the draft **read-only** with *"Being edited on another device — Take over"*. Take over moves the lease; the first device becomes read-only on its next patch. **The lease expires by itself**, so a dead phone cannot hold a draft. While a device holds the lease, **the assistant's edits arrive at that device as a diff to accept** rather than being written; with no lease held, the assistant writes a new version directly (still undoable).
+- **The user's edit is authoritative.** The agent always works from the latest version; if the version changed during a run, its change arrives as a **visible diff** the user accepts or rejects — never a silent overwrite. Each agent edit is a version, so **Undo** per field and **Undo all** are simple.
+- Drafts idle for 30 days are purged by the retention job.
+
+### 23.2 The composer: three stops, one editing surface
+
+A stepper **Compose · Schedule · Review** across the top; the assistant (✦) is available on every stop.
+
+**1 · Compose** — one screen with cards:
+
+- **To** — count and filter chips, or a natural-language query (§7.4); the excluded line names each reason separately (opted out · inactive · no phone, §18.3.1). *Change* opens selection (Select all matching, §18.4).
+- **Message** — editable text with `{name}`, **Preview as** a chosen recipient, and rewrite chips (shorter · friendlier · translate to BM / EN / 中文). Assistant edits appear highlighted with **Undo**.
+- **Image** — none · generate/search (§8) · paste/attach (§18.4).
+
+**2 · Schedule** (the added step) — Send now or **Later** (date and time in the firm's timezone); the pace preset (10 s / 30 s / 60 s / custom, floored by `pacing.min_interval_ms`) and jitter; the **late window** (default 6 h). It shows the arithmetic — *"412 recipients · every 30 s (±25 %) · starts Fri 09:00 · finishes ≈ 12:26"* — the notice *"3 recipients also have a scheduled message today"* (§19.6), which phone will send it and when it was last seen, and *"your phone must be online and running CRMEX for the whole run"* (§15.10).
+
+**3 · Review** — the final summary and the existing two-tap `SendConfirmation` gate with the recipient count. **Confirm & schedule** or **Send now**.
+
+**Leaving the wizard** (Back / Close at any stop) asks **Save draft · Discard · Keep editing**. Nothing is ever sent by leaving. A saved draft appears under Messages → Drafts and resumes at the stop where it was left.
+
+### 23.3 Finding a batch
+
+The **Messages** tab has three segments — **Drafts · Scheduled · History** — and a search bar with filters:
+
+- **Status:** scheduled · running · done · cancelled · failed · expired (scheduled and running listed first, since they are cancellable).
+- **Message text** (words in the body).
+- **Recipient** (client name or number) — answers *"did Fatma get this?"* by finding batches whose recipients include her.
+- **Date range** and **creator**.
+
+Everything is firm-scoped by RLS. Implementation: `send_jobs (org_id, status, scheduled_at)`, a GIN index on `recipients` for recipient lookup, and a text index on `body` (trigram vs `ilike`, MSG-D6). A **batch detail** screen shows status, schedule, pace, per-recipient results (derived from `message_history` rows with `batch_id = job.id`, §18.5), a timeline, **Cancel batch** when allowed, and **Duplicate as draft**.
+
+### 23.4 Cancelling a batch — supersedes §18.6
+
+**Who:** the batch's **creator, and firm owners and admins**, from the phone or the browser. Members cannot cancel other members' batches.
+
+**What "cancel completely" means:** *stop everything not yet sent.* WhatsApp messages already delivered cannot be unsent, and the UI says so plainly: *"130 sent · 282 will not be sent."*
+
+| Batch state | Cancel does | Result |
+| :--- | :--- | :--- |
+| `queued` / scheduled | `queued → cancelled` immediately, via `cancel_send_job(id)` (`security invoker` RPC, so the creator/owner/admin rule is RLS-enforced) | Nothing is sent |
+| `claimed` (running) | Sets **`cancel_requested_at`** and **`cancelled_by`** | The phone sees it over Realtime and **checks it before every send**; it stops, sets remaining `outbox` rows to a new **`CANCELLED`**, marks the unsent recipients `CANCELLED` in `message_history`, and finishes the job as `cancelled` with an honest count |
+| `claimed`, phone offline or dead | `cancel_requested_at` stays set; UI reads *"Cancel requested — waiting for the phone"* | A resumed or relaunched phone **must not resume** a job with `cancel_requested_at`; if it never returns, the dispatcher sweep closes it as `cancelled` and the unsent recipients count as not sent |
+| `done` / `cancelled` / `failed` / `expired` | not offered | — |
+
+- **Precision:** at most **one** message can complete after the request, because the phone checks between sends. This is documented in the UI.
+- **State machine:** `claimed → cancelled` was rejected by `send_jobs_guard()` (TEN-25). It becomes legal **only** when `cancel_requested_at` is set (or set by the phone itself). `cancel_requested_at`, `cancelled_by` are write-once.
+- **Assistant:** `cancel_send_job` is an action in §22.4 (default Ask).
+- **Paused — resume** (§18.5) never re-offers a cancel-requested job.
+- **Reminder- and rule-generated jobs** (§16.7, §19) cancel through the same path.
+
+### 23.5 How this changes §18
+
+§18.4 step 5 becomes the **Schedule stop** above; §18.6 ("a `claimed` campaign cannot be cancelled from the browser") is superseded by §23.4; §18.3.2's status machine gains `cancel_requested_at`; and `outbox` / `message_history` gain a `CANCELLED` value.
+
+### 23.6 Open decisions
+
+| # | Decision | Options | Recommendation |
+| :--- | :--- | :--- | :--- |
+| **MSG-D1** | Stepper vs one long screen | 3 stops as asked / single scroll | **Decided 2026-09-19: 3 stops** — Schedule and Review are separate decisions. |
+| **MSG-D2** | Autosave and conflicts | debounce + version CAS / last-write-wins / edit lock | **Decided 2026-09-19: an edit lock** (a leased lock, §23.1). The plain lock was chosen over version conflict diffs; the lease is what stops a dead phone holding it. |
+| **MSG-D3** | Recipient-level status | add `CANCELLED` / reuse `SKIPPED` | **Decided 2026-09-19: add `CANCELLED`** — skipped means something different (§7.3). |
+| **MSG-D4** | Dead-phone cancel timeout | dispatcher closes after *X* | **Decided 2026-09-19: 30 min**, then `cancelled`. |
+| **MSG-D5** | Duplicate as draft | yes / no | **Decided 2026-09-19: yes**; copies body, audience filter and schedule, not results. |
+| **MSG-D6** | Body search | `pg_trgm` GIN / plain `ilike` | **Decided 2026-09-19: `pg_trgm`** if the extension is available; `ilike` otherwise. |
+| **MSG-D7** | Draft visibility | creator only / firm-shared / creator + owner | **Decided 2026-09-19: the creator, and the firm owner read-only.** Admins and other members cannot see a draft; only the creator can edit or submit it. |
+
+### 23.7 Build order (proposed, after approval)
+
+1. **Migration:** `message_drafts` + versions, `send_jobs.cancel_requested_at` / `cancelled_by`, the amended guard trigger, `cancel_send_job` RPC, `CANCELLED` values, search indexes.
+2. **Composer** in `shared-ui`: Compose cards, **Schedule stop**, Review, leave-the-wizard sheet, Drafts.
+3. **Batches list and detail** with search and filters.
+4. **Phone cancel path** in `jobRunner.ts` (check before every send, no resume of cancel-requested jobs).
+5. **Assistant integration** with the draft row (§22).
+
+Test cases: `test-plan.md` §25.
