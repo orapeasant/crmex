@@ -388,6 +388,58 @@ Designed, not implemented. Uses the §18 two-firm fixture (Firm A: A1, A2; Firm 
 
 ---
 
+## 21. Scheduled bulk send — campaigns (`crmex.md` §18)
+
+Designed, not implemented. Uses the §18 two-firm fixture (Firm A: A1, A2; Firm B: B1). Extends the `send_jobs` cases TEN-23..29, which continue to cover tenancy, the status machine and the atomic claim.
+
+| ID | Scenario | Expected | Level |
+| :--- | :--- | :--- | :--- |
+| CAM-01 | Insert with `scheduled_at` in the future, `interval_ms` below the firm floor, above 1 h, `jitter_pct` of 60, and `expires_at` before `scheduled_at` | First accepted; the other four rejected by the trigger, service role included | I |
+| CAM-02 | A1 claims a job whose `scheduled_at` is still in the future, then again once it has passed | Zero rows before; exactly one row after, `claimed_at` set by the database | I |
+| CAM-03 | A1 claims a `queued` job past its `expires_at` | Zero rows; the dispatcher sweep moves it to `expired` and notifies A1 | I |
+| CAM-04 | Update `scheduled_at`, `interval_ms`, `jitter_pct` or `expires_at` after insert, as A1 and as service role | Rejected — immutable after insert (§18.3) | I |
+| CAM-05 | A campaign with `interval_ms = 30000`, `jitter_pct = 25` | Every gap lies in [22.5 s, 37.5 s]; N recipients produce N-1 gaps | U |
+| CAM-06 | `jitter_pct = 0`; `interval_ms` null | Fixed 30 s gaps; null falls back to the firm `pacing.*` window | U |
+| CAM-07 | Select-all over a filtered result exceeding `limits.max_batch_recipients` | Blocked in the wizard with the count shown; an insert that bypasses the UI is rejected at claim time (existing `jobRunner` check) | I |
+| CAM-08 | A selected client opts out, is set `inactive`, loses their phone number, or leaves the firm between scheduling and `scheduled_at` | Each excluded at claim time and reported under its own reason; the rest of the campaign runs | I |
+| CAM-16 | Selection with a mix of `active`, `inactive` and `archived` clients, some opted out | Only active, non-suppressed, phone-bearing clients are selectable; the excluded line counts opt-out and inactive separately (§18.3.1) | I |
+| CAM-17 | A client is set `inactive` and later back to `active`, having opted out while active | Reactivation does not clear `suppressed_at`; the client is still never messaged | I |
+| CAM-09 | App killed mid-campaign, then relaunched | Unsettled `outbox` rows survive; the job shows **Paused — resume**; claimed-but-unsettled recipients are surfaced, never silently resent (§9.2) | D |
+| CAM-10 | Two campaigns become due at the same moment on one phone | Run sequentially by claim order; neither run's effective interval is shortened | D |
+| CAM-11 | Browser cancels a `queued` campaign, then a `claimed` one | First succeeds; second rejected — the phone owns a claimed run (§18.6) | I |
+| CAM-12 | B1 reads, cancels or claims a Firm A campaign | Zero rows / not found | I |
+| CAM-13 | Progress while a campaign runs | Counts derive from `message_history` rows with `batch_id = job.id`; the browser sees them over Realtime; no counter column exists to disagree | I |
+| CAM-14 | `{name}` used twice in a body; a recipient with no display name | Both occurrences rendered (§9.5); the nameless recipient falls back per C-D4 and is reported | U |
+| CAM-15 | `POST /images/upload` with a non-image, an oversized file, a JPEG, a PNG carrying an `eXIf`/`tEXt` chunk, and a client-supplied path fragment | Non-image, oversized and JPEG all rejected (PNG only, §18.4); the metadata chunks are absent from the stored bytes and the sha256 is of the sanitized result; the object path is built from the JWT and the client fragment ignored | I |
+| CAM-18 | `sanitizePng` unit cases: ancillary chunks dropped and critical ones kept in order; truncated data; a declared chunk length beyond the buffer or past 2^31-1; a malformed chunk type; missing IHDR/IDAT/IEND; bytes trailing after IEND | Valid input round-trips without metadata; every malformed input is rejected rather than partially parsed | U |
+
+---
+
+## 22. Occasion rules (`crmex.md` §19)
+
+Designed, not implemented. Uses the §18 two-firm fixture. The scanner is tested against an **injected clock**, never the wall clock, so leap years and DST are ordinary cases rather than things to wait for.
+
+| ID | Scenario | Expected | Level |
+| :--- | :--- | :--- | :--- |
+| OCC-01 | The scan runs 24 times over one simulated day with a birthday rule in horizon | Exactly one occurrence, one event and one reminder per client — the unique index on `(org_id, rule_id, client_id, occasion_date)` absorbs every later pass (§19.3) | I |
+| OCC-02 | Qualification: clients that are `inactive`, `archived`, opted out, of an excluded `kind`, missing the tag, or with no birth date | None materialized; an active, tagged, non-suppressed client with a date is | I |
+| OCC-03 | A client is opted out or set `inactive` *after* their occurrence is materialized | The occurrence stays, but §16.7 skips it at fire time and notifies the sender — the rule never becomes a second gate | I |
+| OCC-04 | Birthday 29 Feb, scanned across a leap and a non-leap year | Exactly one occurrence per year; 28 Feb when there is no 29th | U |
+| OCC-05 | Client timezone set / unset with `timezone_source = client` | Fire time is 09:00 in the client's zone, else the firm's (§16.13 D6) | U |
+| OCC-06 | 40 clients share one birthday under one rule | Fire times staggered by `pacing.min_interval_ms` from `at_time`; no two occurrences share a fire time (§19.3) | U |
+| OCC-07 | A materialized occurrence is cancelled or re-worded, then the scanner runs again | Not resurrected and not overwritten — the `occasion_occurrences` row is the tombstone and survives `event_id` going null (§19.4) | I |
+| OCC-08 | A rule is disabled, then deleted | Future materialization stops; pending `scheduled` occurrences cancelled with the count shown first; `sent` ones untouched | I |
+| OCC-09 | A rule's body and time are edited | Occurrences materialized afterwards use the new values; pending unapproved ones are regenerated; approved ones are not | I |
+| OCC-10 | `requires_approval = true` (default) reaches its fire time | The sender gets an approval notification; the `send_jobs` row exists only after they tap Send (§16.7 step 2) | I |
+| OCC-11 | B1 reads or edits Firm A rules, client dates or occurrences; A2 (`member`) creates or edits a rule | Zero rows / not found; A2 rejected — rules are owner/admin (§19.2) | I |
+| OCC-12 | A client-audience rule created with `sender_id` set to another member | Rejected, mirroring the `event_reminders` rule | I |
+| OCC-13 | `sender_id` is removed from the firm with occurrences pending | Rule disabled and owners notified; no occurrence sends from another member's phone (O-D5) | I |
+| OCC-14 | A client has both a rule occurrence and a campaign (§18) due the same day | Both delivered, run sequentially with the pacing floor between; the campaign screen warns before confirming (§19.6) | I |
+| OCC-15 | The scanner is down for 3 days, then resumes | Occurrences still inside the horizon are materialized; ones whose fire time has passed follow §16.6.4 (skipped with the sender told), never sent days late | I |
+| OCC-16 | `client_dates` with a duplicate label for one client, and a `once` recurrence already in the past | Duplicate rejected by the unique key; the past one-off produces no occurrence | I |
+
+---
+
 ## Deferred
 
 Admin portal UI cases (screens, dashboards, settings forms) are deferred with the portal itself. Its **server-side** gates are not deferred and are covered above: ROLE-01–05, QTA-01–08, RET-01–08.

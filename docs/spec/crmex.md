@@ -593,6 +593,7 @@ Not addressed in the previous draft, and it shapes the product more than any tec
 This app sends messages to people. The design should assume recipients are the user's own customers or contacts who expect to hear from them, and should make that the path of least resistance:
 
 - **Consent is opt-out, with one flag per client (decided 2026-09-17).** Every client can be messaged by default. `clients.suppressed_at` (the "Opted out" switch on the client page) is that flag. It controls **every** message to the client: manual sends, browser-queued `send_jobs` (§15.10) and scheduled messages such as birthday greetings and hearing reminders (§16.7). An opted-out client is never queued again and is re-checked at claim time. Opting out also cancels the client's pending scheduled messages.
+- **`clients.status` is a separate axis** (§18.3.1). An inactive or archived client is not messaged either, but that is the firm's filing decision, not the person's instruction — reactivating a client never clears an opt-out.
 - `clients.opted_in_at` stays as an informational record of how and when consent was given. **It does not gate sending anywhere.**
 - Surface batch size prominently before sending. A confirmation step that shows "this will message 340 people" is the cheapest guard against an accidental mass send.
 
@@ -786,7 +787,7 @@ Every firm-owned table carries `org_id uuid not null references organizations(id
 | `organizations` | firm | `id, name, plan, created_at`. `plan` writable only by the service role. |
 | `org_members` | firm | `(org_id, user_id)` unique, `role`, `created_at`. |
 | `org_invitations` | firm | `org_id, email, role, token_hash, expires_at, accepted_at`. Store a hash of the token, never the token. |
-| `clients` | firm | CRM contact record: `display_name, phone_e164, email, kind` (`client` / `prospect` / `opposing_counsel` / `court` / `other`), `tags text[]`, `notes`, `opted_in_at` (informational only), `suppressed_at` (the client-level opt-out that controls all messaging, §12), `source` (`manual` / `phone_import`), and, from §16, `birth_date` and `timezone`. `unique (org_id, phone_e164)` where phone is set. Replaces `contact_meta` (§12's consent fields live here). |
+| `clients` | firm | CRM contact record: `display_name, phone_e164, email, kind` (`client` / `prospect` / `opposing_counsel` / `court` / `other`), `tags text[]`, `notes`, `opted_in_at` (informational only), `suppressed_at` (the client-level opt-out that controls all messaging, §12), `source` (`manual` / `phone_import`), `status` (`active` / `inactive` / `archived`, the CRM lifecycle flag from §18.3.1 — not a consent field), and, from §16, `birth_date` and `timezone`. `unique (org_id, phone_e164)` where phone is set. Replaces `contact_meta` (§12's consent fields live here). |
 | `matters` | firm | `matter_number` (unique per firm), `title, practice_area, status` (`open` / `pending` / `closed`), `opened_at, closed_at, notes`. |
 | `matter_clients` | firm | Join: `matter_id, client_id, role` (`client` / `opposing_party` / `witness` / …). |
 | `tasks` | firm | `title, notes, due_at, kind` (`task` / `deadline` / `hearing`), `status` (`open` / `done`), `matter_id` (nullable), `assignee_id` (member). |
@@ -1201,7 +1202,7 @@ Steps 16–19 alone already give a working calendar with reminders. Templates co
 ### 16.11 Deferred (phase 2)
 
 - **Business days and court holidays** (`org_holidays`, `offset_unit = business_days`). Needed for real procedures, but the holiday data is per jurisdiction.
-- **Firm-wide occasion rules** ("every client with a birth date who hasn't opted out gets the greeting") instead of a per-client event.
+- ~~**Firm-wide occasion rules**~~ — promoted out of phase 2 and designed in **§19**.
 - **Explicit matter team** (`matter_members`), which makes the `matter_team` audience precise.
 - **Starter template library** published by the operator and copied into a firm. The operator writes templates, never reads firm data.
 - **Calendar sync / ICS feed.** A per-user ICS URL is a bearer credential exposing privileged dates, so it needs a deliberate decision.
@@ -1426,3 +1427,297 @@ Listed so they can be scheduled in the gyrfalcon repo. None block the dev-only s
 6. **Stage 2 tools** after G4.
 
 Test cases get IDs `AGT-*` in `test-plan.md` §20 once this section is approved.
+
+---
+
+## 18. Scheduled bulk send — campaigns
+
+Designed 2026-09-18. Not implemented. This is the product's headline flow made explicit and given a schedule: **search clients → select some or all → write or generate a message → paste or generate an image → choose when it goes out and how fast → one paced run.**
+
+Nothing here is a new sending mechanism. A campaign is a `send_jobs` row (§15.10) with three added columns and the same claim/outbox/mirror path. §16 (processes and reminders) schedules *one* message off a matter date; this schedules *one message to many clients* off a wall-clock time the user picks.
+
+### 18.1 Why it is only an extension of `send_jobs`
+
+`send_jobs` already carries `org_id`, `created_by`, `body`, `media_path`, `recipients jsonb`, a status machine enforced by trigger for every writer, an atomic claim, and RLS that lets only the creator's phone run it. A campaign needs exactly three things that row does not have: *when* to start, *how fast* to go, and *how late is too late*. Everything else — tenancy, immutability after insert, the `batch_id = job id` link into `message_history` — is reused unchanged.
+
+A second table would duplicate the trigger and the RLS, and would give the phone two queues to poll. There is one queue.
+
+### 18.2 Decisions taken
+
+| # | Decision | Answer |
+| :--- | :--- | :--- |
+| **C1** | Who sends at the scheduled time | **The sender's own phone**, as in §15.10. The phone is positioned as an always-on gateway. |
+| **C2** | Server-side wake-up (FCM) | **Designed for, not built** (§18.9). The claim path is written so a push only makes the phone poll sooner; it never becomes a second sender. |
+| **C3** | Pacing control | **One interval per campaign, with jitter.** The user picks 10 s / 30 s / 60 s / custom; each actual gap is randomized ±25 % around it. Clamped to the firm's `pacing.min_interval_ms` floor. |
+| **C4** | Where a phone-created campaign lives | **The same `send_jobs` row.** Both clients write to Supabase; the phone claims its own row. One code path, and a campaign created on the phone is visible and cancellable from the browser. |
+| **C5** | Late or missed runs | **A late window, then `expired`** — reusing `expires_at` and the `queued → expired` transition already specified in §16.4.1. Default 6 h, set per campaign. |
+
+C4 is a deliberate narrowing of "mobile need not sync": per-message *results* still mirror best-effort (§9.2), but the *campaign itself* is created online. A phone with no connectivity at compose time cannot schedule — it can still send immediately through the existing direct path (`directSender.ts`), which needs no row.
+
+### 18.3 Data model
+
+#### 18.3.1 `clients.status` — who is eligible at all
+
+Decided 2026-09-18. A campaign targets **active clients**; inactive ones are never included. `clients` has no such field today, so this section adds one:
+
+| Column | Type | Meaning |
+| :--- | :--- | :--- |
+| `status` | `text not null default 'active' check (status in ('active', 'inactive', 'archived'))` | CRM lifecycle of the relationship. `inactive` = a former or dormant client kept for history; `archived` = hidden from normal lists entirely. |
+
+**`status` is not consent, and the two must not be merged.** `suppressed_at` (§12) is a standing instruction from the *person* — "stop messaging me" — and it outlives everything: reactivating a client must never resume messaging someone who opted out. `status` is the *firm's* view of the relationship, set by staff for their own filing. A client can be active and opted out (a current client who does not want bulk messages), or inactive and never opted out (a matter that closed).
+
+Both block a campaign, for different reasons, and both are re-checked at claim time. Because they are different reasons, the excluded line names them separately — "3 opted out · 12 inactive" — since a user who sees only a count will assume the wrong one.
+
+Effects elsewhere:
+
+- The Clients list defaults to `status = 'active'`, with a filter to show the others. Archived clients are excluded from search and from NL matching (§7.4) unless explicitly asked for.
+- Scheduled client messages (§16.7) skip a client that is not active at fire time, with the same notification as the other skip reasons.
+- Existing rows default to `active`, so the migration changes no behaviour on its own.
+
+#### 18.3.2 `send_jobs` — when and how fast
+
+Three columns on `send_jobs`, plus the status and constraint from §16.4.1. All nullable, so every existing row and the immediate-send path are unaffected: `scheduled_at is null` means "run as soon as the phone sees it", which is exactly today's behaviour.
+
+| Column | Type | Meaning |
+| :--- | :--- | :--- |
+| `scheduled_at` | `timestamptz` | When the phone may start. Null = immediately (today's behaviour). |
+| `interval_ms` | `integer` | Base gap between consecutive sends. Null = the firm's `pacing.*` window (§9.4). |
+| `jitter_pct` | `smallint not null default 25` | Randomization applied to `interval_ms`, in percent. |
+| `expires_at` | `timestamptz` | From §16.4.1. Past this, the job is never claimed and becomes `expired`. |
+
+Constraints, all enforced in the existing `send_jobs_guard()` trigger so the service role is bound by them too:
+
+- `interval_ms` is null or `>= app_settings.pacing.min_interval_ms` and `<= 3600000` (1 h). The floor is read inside the trigger, not trusted from the client.
+- `jitter_pct between 0 and 50`.
+- `expires_at`, when set, is `> coalesce(scheduled_at, created_at)`.
+- `scheduled_at`, `interval_ms`, `jitter_pct` and `expires_at` are **immutable after insert**, like `body` and `recipients`. Rescheduling is cancel-and-recreate, which keeps one row = one run and avoids a job being re-timed while a phone is mid-claim.
+
+The claim predicate (§15.10) gains two clauses:
+
+```sql
+update send_jobs set status = 'claimed'
+where id = :id and status = 'queued' and created_by = auth.uid()
+  and (scheduled_at is null or scheduled_at <= now())
+  and (expires_at   is null or expires_at   >  now())
+returning *;
+```
+
+Both are re-evaluated by Postgres on the locked row, so the existing concurrency argument (TEN-24, TEN-28) carries over unchanged: a second claimer updates zero rows.
+
+**The predicate alone is not enough, and this is easy to get wrong.** RLS lets the creator update their own row, so a client that simply *omitted* those two clauses would claim a campaign before its time or after its expiry. The `WHERE` clause is what makes the claim **atomic**; it is the **trigger** that makes the schedule **binding**, by rejecting a `queued → claimed` transition outside the window for every writer including `service_role`. Both are needed, for different reasons — the same division as the existing status machine, where the trigger owns legality and the predicate owns concurrency.
+
+A consequence worth stating: the caller's `now` comes from the device clock, so a phone with a skewed clock may *try* to claim early. The trigger uses Postgres `now()`, so the attempt fails. A skewed device can therefore delay its own campaign or waste a claim, but it cannot make one run at the wrong time.
+
+**Expiry** is swept by the §16.6 dispatcher (`queued → expired` where `expires_at <= now()`), and the sender is notified. If §16 ships later than this section, the phone also treats a past-`expires_at` job as expired on sight and reports it; the dispatcher sweep is what covers a phone that never comes back.
+
+### 18.4 The compose flow
+
+Five steps in `shared-ui`, identical on both clients. Steps 1–3 already exist in the send wizard; 4 is partly new, 5 is new.
+
+1. **Find clients.** The existing filters (kind, tag, text) plus natural-language matching (§7.4) against the firm's `clients`. The result is a list the user confirms — a query never becomes a send by itself.
+2. **Select.** Per-row checkboxes and **Select all matching** (the whole result set, not just the loaded page — the count is shown, and it is the count that gets checked against `limits.max_batch_recipients`). Only `status = 'active'` clients are selectable; inactive and archived ones are not offered at all. Clients with no `phone_e164` or with `suppressed_at` set are shown struck through, are not selectable, and are counted in the excluded line, which names each reason separately (§18.3.1). Both status and suppression are re-checked at claim time regardless (§15.10).
+3. **Message.** Free text, or generated via `POST /api/v1/messages/draft`, then edited. `{name}` is the only placeholder, rendered per recipient with `replaceAll` (§9.5). Either the body or an image is required — the existing `send_jobs_content_check`.
+4. **Image (optional).** Three sources:
+   - **Generate or search with AI** — the existing §8 loop, ending at an `image_sessions.current_path`.
+   - **Paste or attach** — new. The client posts the bytes to `POST /api/v1/images/upload`; the server sanitizes them, hashes the result, stores at `<org_id>/<user_id>/<sha256>.png`, and returns the object path and a signed URL, exactly as the generate path does. The path is constructed from the JWT, never from the client. This endpoint is the only gap in the existing server for this feature.
+
+     **PNG only, stripped by chunk rather than re-encoded.** `buildObjectPath` already yields a `.png` path, and `core-server` has no image decoder — accepting JPEG or WebP would mean adding a native dependency (sharp) for one endpoint. PNG's container makes the same guarantee available as a pure structural pass: the file is a sequence of length-tagged chunks, and everything carrying EXIF, GPS, comments or provenance text (`eXIf`, `tEXt`, `zTXt`, `iTXt`, `iCCP`, `tIME`) is an *ancillary* chunk a decoder must be able to ignore. The server keeps a small allowlist (`IHDR`, `PLTE`, `IDAT`, `IEND`, plus `tRNS`/`gAMA`/`sRGB`, which change how the image looks rather than what it reveals) and drops everything else, so an unknown future chunk type is dropped by default. Clients convert to PNG before upload (`canvas.toBlob` in the browser, which incidentally drops EXIF too) — but the server never trusts that, because a client can still send a PNG carrying an `eXIf` chunk. A size cap comes from `app_settings`.
+
+     Why this matters beyond tidiness: a photo pasted from a phone carries the GPS coordinates where it was taken, and these are law firms' clients. Stripping it is not optional, and doing it structurally means it can be verified by reading the code rather than trusting a library.
+   - **Reuse** an image from a previous session.
+5. **Schedule and pace.** *Send now* or a date and time (in the firm's timezone, §16.4.1); the interval preset or a custom value; the late window. The screen shows the arithmetic before confirming, because 400 recipients at 30 s is 3 h 20 m and users do not compute that themselves:
+
+   > **412 recipients · every 30 s (±25 %) · starts Fri 19 Sep 09:00 · finishes ≈ 12:26**
+   > Your phone must be online and running CRMEX for the whole run.
+
+   Then the existing `SendConfirmation` gate (§9, `confirmationGate.ts`) with the recipient count.
+
+### 18.5 Running a campaign
+
+The phone's `jobRunner.ts` changes in two places and nowhere else: `listRunnableJobs` filters on the two new time clauses, and the pacing window handed to the Node payload comes from the job rather than the global default.
+
+```
+claim ──▶ re-check status + suppression + onWhatsApp() ──▶ write every recipient to outbox PENDING
+      ──▶ hand batch + pacing window to Node over IPC
+      ──▶ per result: update outbox, mirror to message_history (batch_id = job id)
+      ──▶ status = done (or failed)
+```
+
+Pacing math stays in `shared-ui/src/pacing/pacing.ts`: a campaign is just a `PacingWindow` of `{ min: interval*(1-jitter), max: interval*(1+jitter) }`, so `randomInterval` and its tests are reused as they are. The plain-JS copy in the Node payload (§10.4) needs no change — it already takes a window.
+
+**Interruption.** A 3-hour run will outlive a `dataSync` foreground service's 6-hour cap only rarely, but it will certainly meet OEM battery kills (§10.2). The run is resumable because `outbox` holds every unsettled recipient (§9.2), and resumption is the existing path: on launch, unsettled rows for a `claimed` job are re-offered. A job that is `claimed` with unsettled `outbox` rows and no running batch is shown as **Paused — resume**, never silently restarted, because the claimed-but-unsettled row may already have been delivered (§9.2).
+
+**Progress** is derived, not stored: `message_history` rows carrying `batch_id = job.id` give sent/failed/skipped counts, and the browser watches them over Realtime. No counter column, so a phone that dies mid-run cannot leave a lying number behind.
+
+### 18.6 What the browser can do
+
+Create, watch and cancel. It cannot send.
+
+- Create a campaign, scheduled or immediate — the phone runs both.
+- See every campaign in the firm (RLS: firm members read the firm's jobs), with status, schedule, pace and live per-recipient results.
+- Cancel while `queued` (creator only, existing policy). A `claimed` campaign cannot be cancelled from the browser — the phone is mid-run and owns it; the phone's own UI stops it.
+- The campaign list must say plainly, per §15.10, that a scheduled campaign runs **only while the creator's phone is online with CRMEX running**, and it shows which phone (last-seen) so the claim is checkable rather than hopeful.
+
+### 18.7 Limits and safety
+
+- `limits.max_batch_recipients` is checked in the UI, re-checked at claim time (already in `jobRunner.ts`), and is the reason **Select all** shows a count first.
+- The pacing floor is a firm setting, not a user choice: a user can slow a campaign down but not speed it past `pacing.min_interval_ms`.
+- Suppression (§12, opt-out) and `status` (§18.3.1) each exclude at selection *and* at claim, and are reported as distinct reasons. Unregistered numbers resolve to `SKIPPED`, not `FAILED` (§7.3).
+- One image and one body per campaign. Per-recipient variation beyond `{name}` is out of scope; it multiplies the review surface and is the shape that turns this into a spam tool.
+- Quotas count a campaign's messages the same as manual ones (`usage_daily`, `org_usage_daily`).
+
+### 18.8 Open decisions
+
+| # | Decision | Options | Recommendation |
+| :--- | :--- | :--- | :--- |
+| **C-D1** | Default interval preset | 10 s / 30 s / 60 s | **Decided 2026-09-18: 30 s**, with 10 s seeded as `pacing.min_interval_ms`. The current global window is 7–18 s, which is fine for a handful of recipients and aggressive for 400. |
+| **C-D2** | Campaign size ceiling | reuse `limits.max_batch_recipients` / a separate, lower campaign cap | **Decided 2026-09-18: reuse it.** One number to reason about. |
+| **C-D3** | Two campaigns due at the same time on one phone | run sequentially / refuse to schedule an overlap / run and let pacing interleave | **Sequentially**, by claim order. Interleaving two paced runs makes both effective rates wrong. |
+| **C-D4** | `{name}` fallback when a client has no display name | skip the recipient / render empty / render a generic word | **Render the client's phone-book name, else skip the recipient** and report it in the excluded line. A message opening "Hi ," is worse than not sending. |
+| **C-D5** | Editing a scheduled campaign | cancel-and-recreate only / allow editing body before `scheduled_at` | **Decided 2026-09-18: cancel-and-recreate** (§18.3), enforced by the trigger's immutability check rather than only by the absence of an edit button. |
+
+### 18.9 Deferred — server-side wake-up
+
+Recorded so the design does not have to change when it is built. The phone stays the only sender; a push only shortens the delay between `scheduled_at` and the claim.
+
+1. The phone registers an FCM token per device against `created_by`.
+2. The §16.6 dispatcher, on each tick, pushes a data-only message to the creator's devices for jobs that have just become due.
+3. The app wakes, polls `listRunnableJobs`, and claims through the identical predicate. A push that arrives twice, late, or on two devices changes nothing: the atomic claim is still the only thing that decides who sends.
+
+Until then, `expires_at` is what keeps a late campaign from going out at the wrong time, and the UI says so.
+
+### 18.10 Build order (proposed, after approval)
+
+1. **Migration** — `clients.status` (§18.3.1) with its default and the active-only list filter; the three `send_jobs` columns, the trigger constraints, the claim predicate, the `expired` status (shared with §16.4.1 if that lands first).
+2. **`POST /api/v1/images/upload`** — pasted and attached images, with the type, size and EXIF rules of §18.4.
+3. **Wizard steps 4–5** in `shared-ui` — image source picker, schedule and pace screen with the duration estimate.
+4. **`jobRunner.ts`** — time-aware `listRunnableJobs`, per-job pacing window, expired handling, the Paused/resume state.
+5. **Campaign list** — status, derived progress, cancel — in both shells.
+6. **FCM wake-up** (§18.9), separately.
+
+Test cases get IDs `CAM-*` in `test-plan.md` §21 once this section is approved.
+
+---
+
+## 19. Occasion rules — recurring client notifications
+
+Designed 2026-09-18. Not implemented. Promotes the item deferred in §16.11: *"firm-wide occasion rules ('every client with a birth date who hasn't opted out gets the greeting') instead of a per-client event."*
+
+§16 covers dates a person enters on one matter or one client. This covers the standing instruction — **"every client gets a birthday message at 09:00, forever"** — that nobody should have to re-enter per client. A firm defines the rule once; a scanning job finds who qualifies and materializes the occurrences.
+
+### 19.1 The rule is not the sender
+
+The scanner **materializes `events` and `event_reminders`** (§16.4.3) and stops there. Everything after that is the existing path, unchanged:
+
+```
+occasion_rules ──scan──▶ events + event_reminders ──§16.6 dispatcher──▶
+    staff notification, or §16.7 client message ──▶ send_jobs ──▶ phone ──▶ WhatsApp
+```
+
+This is the whole design decision, and it is worth stating why, because a rule engine that sends directly would be less code today:
+
+- **One delivery path.** Opt-out, `status` (§18.3.1), expiry, approval, the atomic claim and at-most-once delivery are already solved in §16.7 and §15.10. A second sender would have to re-solve every one of them, and would get at-most-once wrong first.
+- **The occurrence is visible and editable.** A materialized birthday shows on the calendar three weeks out, can be moved, cancelled, re-worded for one client, or approved — because it is an ordinary `events` row. A rule evaluated at send time is invisible until it fires, which is when it is too late to check.
+- **The dispatcher stays one thing.** No new tick, no second claim protocol.
+
+The scanner's only job is deciding **who and when**. It never decides **whether to send**.
+
+### 19.2 Data model
+
+```text
+occasion_rules
+  id, org_id, created_by
+  name                    -- "Birthday greeting"
+  occasion                -- birthday | client_since | matter_closed | custom_date
+  custom_date_label text  -- occasion = custom_date: which client_dates label
+  enabled boolean not null default true
+  -- who qualifies
+  audience_kinds text[]   -- clients.kind values, default '{client}'
+  audience_tags text[]    -- empty = no tag filter; otherwise the client must carry one
+  -- when it fires, relative to the occasion date
+  lead_days int not null default 0      -- 0 = on the day, 3 = three days before
+  at_time time not null default '09:00'
+  timezone_source         -- client | firm   (§16.13 D6: client's own if set, else firm's)
+  -- what it produces
+  audience                -- client | staff
+  body_template text      -- client audience; {name} only, as everywhere else
+  requires_approval boolean not null default true   -- §16.13 D3
+  sender_id uuid          -- client audience: whose WhatsApp. Same rule as event_reminders.
+  staff_audience          -- staff audience: assignee | firm_admins
+  horizon_days int not null default 30  -- how far ahead occurrences are materialized
+  timestamps
+
+client_dates              -- arbitrary dated occasions per client, beyond birth_date
+  id, org_id, client_id (composite FK), created_by
+  label text              -- "Wedding anniversary", "Company founded"
+  date date not null
+  recurrence              -- yearly | once
+  timestamps
+  unique (org_id, client_id, label)
+
+occasion_occurrences      -- the scanner's idempotency ledger
+  id, org_id, rule_id (composite FK), client_id (composite FK)
+  occasion_date date      -- the occasion itself, e.g. 2027-03-14
+  event_id                -- what was materialized (null once the event is deleted)
+  created_at
+  unique (org_id, rule_id, client_id, occasion_date)
+```
+
+`clients.birth_date` already arrives with §16.4.1. `client_dates` covers everything else — anniversaries, retainer dates, whatever a firm tracks — without a schema change per occasion type. `matter_closed` reads `matters.closed_on` and produces one occurrence per closed matter, not per client.
+
+**RLS**: members select `occasion_rules` and `client_dates`; **owner/admin** insert, update and delete rules, because a rule reaches every client in the firm (the same reasoning as §16.13 D5 for templates). `client_dates` follows the `clients` policy — any member may add a date to a client. `occasion_occurrences` is written by the scanner (service role) only; members may read it. A rule with `audience = client` may only be created with `sender_id = auth.uid()`, mirroring `event_reminders`.
+
+### 19.3 The scan
+
+Runs in the §16.6 dispatcher process, **once an hour** rather than every 60 s — occurrences are materialized days ahead, so the scan is never on the delivery path. Per enabled rule, per firm:
+
+1. Compute the window: occasion dates falling between now and `now + horizon_days`.
+2. Select qualifying clients: `status = 'active'` (§18.3.1), `suppressed_at is null` for client-audience rules, `kind` in `audience_kinds`, carrying one of `audience_tags` if set, and holding the source date.
+3. For each, compute this year's occasion date and the fire time (`occasion_date - lead_days` at `at_time`, in the client's timezone if set and `timezone_source = client`, else the firm's).
+4. `insert ... on conflict (org_id, rule_id, client_id, occasion_date) do nothing`. **This is the only thing standing between a job that "keeps scanning" and a client receiving the same birthday message every hour.** The unique index is the guarantee; the scanner's own bookkeeping is not trusted.
+5. On a fresh insert, create the `events` row (`recurrence = yearly`, `client_id`, `date_source = projected`) and its `event_reminders` row, which is what the §16.6 dispatcher will pick up.
+
+**29 February** resolves to 28 February in non-leap years — one occurrence per year, never zero, never two (SCH-14 already asserts this for per-client yearly events; the rule path must agree).
+
+**Same-day pile-up.** Forty birthdays on one date would otherwise produce forty `send_jobs` all due at 09:00. The phone runs them sequentially (C-D3), so they would go out back to back with no pacing between jobs. The scanner therefore **staggers** a rule's occurrences that share a fire time, spacing them by the firm's `pacing.min_interval_ms` starting at `at_time`. Forty messages at a 30 s floor span twenty minutes, which is what a person sending them by hand would look like.
+
+### 19.4 Editing a rule, and what does not change retroactively
+
+A rule is a generator, not a live view. Once an occurrence is materialized it is an ordinary event, and it belongs to the firm, not the rule:
+
+- **Disabling or deleting a rule** stops future materialization. Already-materialized occurrences that are `scheduled` are cancelled, and the count is shown before confirming ("this cancels 23 pending messages"). Anything already `sent` is history and is untouched.
+- **Editing the body or time** affects occurrences materialized *after* the edit. Pending ones are re-generated only if they have not been approved, and the UI says which.
+- **Editing a materialized occurrence** — re-wording one client's message, moving it, cancelling it — is permanent for that occurrence. The next scan must not resurrect it: the `occasion_occurrences` row is the tombstone, and it survives the event's deletion (`event_id` goes null).
+- **A client who should never receive a rule's messages** is handled per-client, not by editing the rule: cancelling their occurrence each year is a trap. `clients.suppressed_at` covers "no messages at all"; for "no birthday messages specifically", see O-D2.
+
+### 19.5 Approval, and why it is the default
+
+`requires_approval = true` by default (§16.13 D3). Materialization is silent, but delivery is not: at fire time the sender gets "Birthday message to Fatma is ready" with Review / Send / Skip, and tapping Send is what inserts the `send_jobs` row under normal RLS (§16.7 step 2).
+
+This matters more for rules than for hand-made reminders, because a rule is the one mechanism here that can message people **nobody chose individually**. A firm that turns approval off is choosing automatic outbound messaging to its whole client list; the UI should say that in those words, and §12's framing applies directly.
+
+With approval on, the honest description of the feature is *"it drafts and queues; you tap send"* — which is also what keeps it on the right side of §12.
+
+### 19.6 Interaction with campaigns (§18)
+
+Both end at `send_jobs`, and a client can be in both on the same day. They are not deduplicated, because a birthday message and a firm announcement are different messages and suppressing either silently would be worse. The phone runs them sequentially with the pacing floor between, and the campaign screen shows "3 recipients also have a scheduled message today" before confirming.
+
+### 19.7 Open decisions
+
+| # | Decision | Options | Recommendation |
+| :--- | :--- | :--- | :--- |
+| **O-D1** | Which occasions ship first | birthday only / birthday + `client_dates` / all four | **Birthday + `client_dates`.** `client_dates` is one small table and covers anniversaries without a second release; `matter_closed` needs its own audience rules. |
+| **O-D2** | Per-client exclusion from one rule | a `client_rule_exclusions` table / a reserved tag (`no-birthday`) / cancel each occurrence | **Exclusions table.** A tag is a per-firm convention the system cannot enforce; cancelling annually is a trap (§19.4). |
+| **O-D3** | Horizon | 30 days / 90 / per rule | **Per rule, defaulting to 30.** A 3-day-lead birthday needs a week; "anniversary, 30 days before" needs more. |
+| **O-D4** | Staff-audience rules in phase 1 | yes / client-only first | **Client-only first.** "Tell me about upcoming birthdays" is a calendar query, not a notification, and the calendar already shows materialized occurrences. |
+| **O-D5** | Rule ownership when `sender_id` leaves the firm | disable the rule / reassign to an owner / fail each occurrence | **Disable and notify the owners.** Silently reassigning sends a client's message from a phone the firm did not choose. |
+
+### 19.8 Build order (proposed, after approval)
+
+1. **Migration** — `occasion_rules`, `client_dates`, `occasion_occurrences` with the unique index, RLS and grants.
+2. **Scanner** in the dispatcher — window, qualification, idempotent insert, materialization, stagger, leap-year handling. Tested against a clock, not the wall clock.
+3. **Rule UI** — list, create/edit under Settings (owner/admin), the disable-with-count confirmation.
+4. **Client dates** on the client page.
+5. **Exclusions** (O-D2), then further occasion types.
+
+Test cases get IDs `OCC-*` in `test-plan.md` §22 once this section is approved.
